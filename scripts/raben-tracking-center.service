@@ -1,0 +1,19 @@
+[Unit]
+Description=Raben Tracking Center Web App
+After=network.target
+
+[Service]
+Type=simple
+User=raben
+Group=raben
+WorkingDirectory=/opt/raben-tracking-center
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/raben-tracking-center.log
+StandardError=append:/var/log/raben-tracking-center.log
+
+[Install]
+WantedBy=multi-user.target
