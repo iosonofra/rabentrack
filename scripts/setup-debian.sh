@@ -34,7 +34,14 @@ export DEBIAN_FRONTEND=noninteractive
 echo ""
 echo -e "${YELLOW}==> 1/6 Aggiornamento pacchetti e installazione Node.js 22 LTS...${NC}"
 apt-get update
-apt-get install -y --no-install-recommends curl ca-certificates gnupg git tzdata
+apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    gnupg \
+    git \
+    tzdata \
+    python3 \
+    build-essential
 
 # Installazione Node.js 22 LTS via NodeSource ufficiale
 if ! command -v node >/dev/null 2>&1 || [ "$(node -v | cut -d'.' -f1 | tr -d 'v')" -lt 20 ]; then

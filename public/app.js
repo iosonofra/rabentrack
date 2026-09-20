@@ -29,6 +29,8 @@ let lastVerificationReport = null;
 let controlUnsyncedFilter = false;
 let bulkTrackingRunning = false;
 let bulkTrackingSuccessTimeout = null;
+let bulkTrackingPreviewFilter = 'all';
+let bulkTrackingLastRetryItems = [];
 let prestaShopCarrierCatalog = null;
 let activeReportFilter = 'all';
 let reportSearchQuery = '';
@@ -559,22 +561,16 @@ function renderRabenStatusFilters(counts = {}, archivedCount = 0, attentionTotal
   const select = $('#control-raben-filter');
   statuses.forEach((status) => { if (![...select.options].some((option) => option.value === status)) select.add(new Option(status, status)); });
   if (![...select.options].some((option) => option.value === 'Archiviate')) select.add(new Option('Archiviate', 'Archiviate'));
-  const primaryStatuses = ['Prenotata', 'In transito', 'Centro di distribuzione', 'In consegna', 'Consegnata'];
   const attentionStatuses = statuses.filter((status) => ['attention', 'incomplete'].includes(rabenFilterKind(status)));
-  const secondaryStatuses = statuses.filter((status) => !primaryStatuses.includes(status) && !attentionStatuses.includes(status));
   const attentionCount = attentionTotal ?? attentionStatuses.reduce((sum, status) => sum + Number(counts[status] || 0), 0);
-  const secondaryCount = secondaryStatuses.reduce((sum, status) => sum + Number(counts[status] || 0), 0);
-  const secondaryActive = secondaryStatuses.includes(activeStatus);
-  const primaryButtons = primaryStatuses.filter((status) => counts[status] > 0).map((status) => `<button type="button" class="control-quick-filter ${rabenFilterKind(status)} ${activeStatus === status && !exceptionActive ? 'active' : ''}" data-raben-status="${escapeHtml(status)}"><span>${escapeHtml(status)}</span><strong>${counts[status]}</strong></button>`).join('');
+  const statusButtons = statuses.filter((status) => !attentionStatuses.includes(status)).map((status) => `<button type="button" class="control-quick-filter ${rabenFilterKind(status)} ${activeStatus === status && !exceptionActive ? 'active' : ''}" data-raben-status="${escapeHtml(status)}" aria-pressed="${activeStatus === status && !exceptionActive}"><span>${escapeHtml(status)}</span><strong>${counts[status]}</strong></button>`).join('');
   const attentionButton = attentionCount
-    ? `<button type="button" class="control-quick-filter attention ${exceptionActive ? 'active' : ''}" data-control-filter="attention"><span>Richiedono attenzione</span><strong>${attentionCount}</strong></button>`
-    : '';
-  const secondaryMenu = secondaryCount
-    ? `<select id="control-other-status" class="control-other-select${secondaryActive ? ' active' : ''}" aria-label="Filtra per altri stati Raben"><option value="">Altri stati · ${secondaryCount}</option>${secondaryStatuses.map((status) => `<option value="${escapeHtml(status)}"${activeStatus === status ? ' selected' : ''}>${escapeHtml(status)} · ${counts[status]}</option>`).join('')}</select>`
+    ? `<button type="button" class="control-quick-filter attention ${exceptionActive ? 'active' : ''}" data-control-filter="attention" aria-pressed="${exceptionActive}"><span>Richiedono attenzione</span><strong>${attentionCount}</strong></button>`
     : '';
   const unsyncedButton = `<button type="button" id="control-filter-unsynced" class="control-filter-pill-unsynced ${controlUnsyncedFilter ? 'active' : ''} ${unsyncedCount > 0 ? 'has-unsynced' : ''}" aria-pressed="${controlUnsyncedFilter}" title="Mostra solo le spedizioni non ancora sincronizzate su PrestaShop"><span class="unsynced-dot" aria-hidden="true"></span><span>Da sincronizzare PrestaShop</span><strong id="control-unsynced-count">${unsyncedCount}</strong></button>`;
-  const archivedButton = `<button type="button" class="control-quick-filter archived ${activeStatus === 'Archiviate' ? 'active' : ''}" data-raben-status="Archiviate" title="Visualizza solo spedizioni archiviate"><span>Archiviate</span><strong>${archivedCount}</strong></button>`;
-  bar.innerHTML = `<span class="filter-bar-label">Stati Raben</span><button type="button" class="control-quick-filter ${!activeStatus && !exceptionActive && controlMetricFilter === 'all' && !controlUnsyncedFilter ? 'active' : ''}" data-control-filter="all"><span>Tutte</span><strong>${total}</strong></button>${primaryButtons}${attentionButton}${secondaryMenu}<span class="control-filter-spacer"></span>${unsyncedButton}${archivedButton}`;
+  const archivedButton = `<button type="button" class="control-quick-filter archived ${activeStatus === 'Archiviate' ? 'active' : ''}" data-raben-status="Archiviate" aria-pressed="${activeStatus === 'Archiviate'}" title="Visualizza solo spedizioni archiviate"><span>Archiviate</span><strong>${archivedCount}</strong></button>`;
+  const allActive = !activeStatus && !exceptionActive && controlMetricFilter === 'all' && !controlUnsyncedFilter;
+  bar.innerHTML = `<span class="filter-bar-label">Stati Raben</span><button type="button" class="control-quick-filter ${allActive ? 'active' : ''}" data-control-filter="all" aria-pressed="${allActive}"><span>Tutte</span><strong>${total}</strong></button>${statusButtons}${attentionButton}<span class="control-filter-spacer"></span>${unsyncedButton}${archivedButton}`;
 }
 
 function caseBadge(status) {
@@ -2499,69 +2495,91 @@ function setupControlWorkspace() {
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
           </button>
         </div>
-        <p class="control-bulk-tracking-intro">
-          Stai per trasmettere il codice di tracking e associare il corriere su PrestaShop per le spedizioni selezionate.
-        </p>
-        <div class="control-bulk-tracking-cards">
-          <div class="control-bulk-tracking-card actionable">
-            <div class="control-bulk-tracking-card-header">
-              <span class="control-bulk-tracking-card-title">Pronte per la sincronizzazione</span>
-              <strong id="control-bulk-tracking-ready-count" class="control-bulk-tracking-card-count">0</strong>
-            </div>
-            <p class="control-bulk-tracking-card-desc">Spedizioni con riferimento ordine collegato.</p>
+        <div class="control-bulk-tracking-body">
+          <section id="control-bulk-tracking-summary" class="control-bulk-tracking-summary" aria-live="polite">
+            <strong id="control-bulk-tracking-summary-title">0 spedizioni pronte</strong>
+            <span id="control-bulk-tracking-summary-text">Verrà inviato solo il tracking. Corriere e stato resteranno invariati.</span>
+          </section>
+          <div id="control-bulk-tracking-unlinked-note" class="control-bulk-tracking-unlinked-note" hidden>
+            <strong><span id="control-bulk-tracking-unlinked-count">0</span> spedizioni escluse</strong>
+            <span>Non hanno un ordine PrestaShop collegato.</span>
           </div>
-          <div class="control-bulk-tracking-card skipped">
-            <div class="control-bulk-tracking-card-header">
-              <span class="control-bulk-tracking-card-title">Senza ordine collegato</span>
-              <strong id="control-bulk-tracking-unlinked-count" class="control-bulk-tracking-card-count">0</strong>
-            </div>
-            <p class="control-bulk-tracking-card-desc">Ignorate perché prive di ordine PrestaShop.</p>
-          </div>
-        </div>
-        <div class="control-bulk-tracking-options">
-          <label class="control-bulk-field-label">
-            Corriere PrestaShop da associare
-            <select id="control-bulk-tracking-carrier" class="control-bulk-select" required>
-              <option value="">Caricamento corrieri…</option>
-            </select>
-          </label>
-          <div class="control-bulk-state-option-block">
+          <div class="control-bulk-tracking-protection">
             <label class="control-bulk-checkbox-label">
-              <input id="control-bulk-tracking-update-state" type="checkbox">
-              <span>Aggiorna anche lo stato degli ordini su PrestaShop</span>
+              <input id="control-bulk-tracking-skip-diff" type="checkbox" checked>
+              <span>Proteggi i tracking differenti già presenti</span>
             </label>
-            <div id="control-bulk-tracking-state-wrap" class="control-bulk-state-dropdown-wrap" hidden>
-              <select id="control-bulk-tracking-state" class="control-bulk-select">
-                <option value="">Seleziona nuovo stato ordine…</option>
-              </select>
-            </div>
+            <p>Gli ordini con un tracking diverso verranno saltati e segnalati nel risultato.</p>
           </div>
-          <label class="control-bulk-checkbox-label">
-            <input id="control-bulk-tracking-skip-diff" type="checkbox" checked>
-            <span>Non sovrascrivere se l'ordine ha già un tracking diverso su PrestaShop</span>
-          </label>
-          <p class="control-bulk-field-hint">
-            Protegge gli ordini che hanno già un tracking registrato sul negozio, evitando sovrascritture accidentali.
-          </p>
+          <details id="control-bulk-tracking-advanced" class="control-bulk-tracking-advanced">
+            <summary>
+              <span>Modifiche aggiuntive</span>
+              <small id="control-bulk-tracking-advanced-status">Corriere invariato · Stato invariato</small>
+            </summary>
+            <div class="control-bulk-tracking-options">
+              <div class="control-bulk-carrier-option-block">
+                <label class="control-bulk-checkbox-label">
+                  <input id="control-bulk-tracking-change-carrier" type="checkbox" aria-controls="control-bulk-tracking-carrier-wrap" aria-expanded="false">
+                  <span>Cambia il corriere su PrestaShop</span>
+                </label>
+                <div id="control-bulk-tracking-carrier-wrap" class="control-bulk-dependent-field" hidden>
+                  <label class="control-bulk-field-label" for="control-bulk-tracking-carrier">Nuovo corriere</label>
+                  <select id="control-bulk-tracking-carrier" class="control-bulk-select" disabled>
+                    <option value="">Caricamento corrieri…</option>
+                  </select>
+                </div>
+              </div>
+              <div class="control-bulk-state-option-block">
+                <label class="control-bulk-checkbox-label">
+                  <input id="control-bulk-tracking-update-state" type="checkbox" aria-controls="control-bulk-tracking-state-wrap" aria-expanded="false">
+                  <span>Aggiorna lo stato degli ordini</span>
+                </label>
+                <div id="control-bulk-tracking-state-wrap" class="control-bulk-dependent-field" hidden>
+                  <label class="control-bulk-field-label" for="control-bulk-tracking-state">Nuovo stato PrestaShop</label>
+                  <select id="control-bulk-tracking-state" class="control-bulk-select" disabled required aria-describedby="control-bulk-tracking-state-error">
+                    <option value="">Seleziona nuovo stato ordine…</option>
+                  </select>
+                  <span id="control-bulk-tracking-state-error" class="control-bulk-field-error" hidden>Scegli lo stato da applicare prima di procedere.</span>
+                </div>
+              </div>
+            </div>
+          </details>
+          <section class="control-bulk-tracking-preview" aria-labelledby="control-bulk-tracking-preview-title">
+            <div class="control-bulk-tracking-preview-heading">
+              <h4 id="control-bulk-tracking-preview-title">Anteprima operazione</h4>
+              <div id="control-bulk-tracking-preview-filters" class="control-bulk-tracking-preview-filters" aria-label="Filtra anteprima">
+                <button type="button" class="active" data-filter="all" aria-pressed="true">Tutte <span id="control-bulk-filter-all-count">0</span></button>
+                <button type="button" data-filter="ready" aria-pressed="false">Pronte <span id="control-bulk-filter-ready-count">0</span></button>
+                <button type="button" data-filter="attention" aria-pressed="false">Da verificare <span id="control-bulk-filter-attention-count">0</span></button>
+              </div>
+            </div>
+            <div class="control-bulk-tracking-preview-table" role="table" aria-label="Spedizioni da inviare">
+              <div class="control-bulk-tracking-preview-columns" role="row">
+                <span role="columnheader">Ordine e tracking</span>
+                <span role="columnheader">Stato attuale</span>
+                <span role="columnheader">Operazione</span>
+              </div>
+              <div id="control-bulk-tracking-preview-list" class="control-bulk-tracking-preview-list" role="rowgroup"></div>
+            </div>
+          </section>
+          <p id="control-bulk-tracking-message" class="message" role="status" aria-live="polite"></p>
         </div>
-        <div id="control-bulk-tracking-preview-list" class="control-bulk-tracking-preview-list"></div>
-        <p id="control-bulk-tracking-message" class="message" aria-live="polite"></p>
-        <div class="prestashop-dialog-actions">
+        <div class="prestashop-dialog-actions control-bulk-tracking-actions">
           <button id="cancel-control-bulk-tracking" type="button" class="secondary">Annulla</button>
           <button id="confirm-control-bulk-tracking" type="button" class="control-bulk-confirm-btn">
-            Invia tracking (<span id="control-bulk-tracking-confirm-num">0</span>)
+            <span id="control-bulk-tracking-confirm-label">Invia 0 tracking</span>
           </button>
         </div>
       </div>
-      <div id="control-bulk-tracking-progress-wrap" class="prestashop-bulk-progress-wrap" hidden>
+      <div id="control-bulk-tracking-progress-wrap" class="prestashop-bulk-progress-wrap" tabindex="-1" aria-labelledby="control-bulk-tracking-progress-title" hidden>
         <svg class="prestashop-bulk-progress-spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"></circle><path d="M12 2a10 10 0 0 1 10 10" stroke-linecap="round"></path></svg>
-        <h3 class="prestashop-bulk-progress-title">Invio tracking a PrestaShop…</h3>
+        <h3 id="control-bulk-tracking-progress-title" class="prestashop-bulk-progress-title">Invio tracking a PrestaShop…</h3>
         <div class="prestashop-bulk-progress-bar-wrap">
           <div class="prestashop-bulk-progress-labels">
             <span id="control-bulk-tracking-progress-text">0 di 0</span>
             <span id="control-bulk-tracking-progress-percent">0%</span>
           </div>
-          <div class="prestashop-bulk-progress-track">
+          <div class="prestashop-bulk-progress-track" role="progressbar" aria-label="Avanzamento invio tracking" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <div id="control-bulk-tracking-progress-bar" class="prestashop-bulk-progress-bar"></div>
           </div>
         </div>
@@ -2576,13 +2594,14 @@ function setupControlWorkspace() {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
         </div>
         <div class="prestashop-success-content">
-          <span class="prestashop-success-eyebrow">Operazione completata</span>
+          <span id="control-bulk-tracking-success-eyebrow" class="prestashop-success-eyebrow">Operazione completata</span>
           <h3 class="prestashop-success-title" id="control-bulk-tracking-success-title">Sincronizzazione completata!</h3>
           <p id="control-bulk-tracking-success-desc" class="prestashop-success-desc"></p>
           <div id="control-bulk-tracking-kpi-grid" class="control-bulk-tracking-kpi-grid"></div>
           <div id="control-bulk-tracking-errors-box" class="prestashop-bulk-errors" hidden></div>
         </div>
         <div class="prestashop-dialog-actions prestashop-success-actions">
+          <button id="control-bulk-tracking-retry-btn" type="button" hidden>Riprova non riusciti</button>
           <button id="control-bulk-tracking-success-close-btn" type="button" class="secondary prestashop-quick-close">Chiudi e aggiorna</button>
         </div>
       </div>
@@ -2615,9 +2634,38 @@ function setupControlWorkspace() {
   $('#control-bulk-tracking-update-state')?.addEventListener('change', (e) => {
     const wrap = $('#control-bulk-tracking-state-wrap');
     if (wrap) wrap.hidden = !e.target.checked;
+    const select = $('#control-bulk-tracking-state');
+    if (select) select.disabled = !e.target.checked;
+    e.target.setAttribute('aria-expanded', String(e.target.checked));
+    updateBulkTrackingDialog();
+    if (e.target.checked) select?.focus();
+  });
+  $('#control-bulk-tracking-change-carrier')?.addEventListener('change', (event) => {
+    const changeCarrier = event.target.checked;
+    const wrap = $('#control-bulk-tracking-carrier-wrap');
+    const select = $('#control-bulk-tracking-carrier');
+    if (wrap) wrap.hidden = !changeCarrier;
+    if (select) select.disabled = !changeCarrier;
+    event.target.setAttribute('aria-expanded', String(changeCarrier));
+    updateBulkTrackingDialog();
+    if (changeCarrier) select?.focus();
+  });
+  $('#control-bulk-tracking-carrier')?.addEventListener('change', updateBulkTrackingDialog);
+  $('#control-bulk-tracking-state')?.addEventListener('change', updateBulkTrackingDialog);
+  $('#control-bulk-tracking-skip-diff')?.addEventListener('change', updateBulkTrackingDialog);
+  $('#control-bulk-tracking-preview-filters')?.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-filter]');
+    if (!button) return;
+    bulkTrackingPreviewFilter = button.dataset.filter;
+    updateBulkTrackingDialog();
   });
   $('#stop-control-bulk-tracking')?.addEventListener('click', () => {
     bulkTrackingRunning = false;
+    const stopButton = $('#stop-control-bulk-tracking');
+    if (stopButton) {
+      stopButton.disabled = true;
+      stopButton.textContent = 'Interruzione in corso…';
+    }
     const info = $('#control-bulk-tracking-progress-info');
     if (info) info.textContent = 'Interruzione richiesta, completamento richiesta attiva…';
   });
@@ -2625,6 +2673,19 @@ function setupControlWorkspace() {
     const selectedRows = controlRecords.filter((row) => controlSelectedTrackingNumbers.has(row.trackingNumber));
     const readyList = selectedRows.filter((row) => Boolean(row.orderReference || row.orderId));
     executeBulkTrackingSync(readyList);
+  });
+  $('#control-bulk-tracking-retry-btn')?.addEventListener('click', () => {
+    if (!bulkTrackingLastRetryItems.length) return;
+    executeBulkTrackingSync([...bulkTrackingLastRetryItems]);
+  });
+  controlBulkTrackingDialog?.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !bulkTrackingRunning) {
+      const confirm = $('#confirm-control-bulk-tracking');
+      if (confirm && !confirm.disabled && !confirm.hidden) {
+        event.preventDefault();
+        confirm.click();
+      }
+    }
   });
 
   const reportDialog = $('#verification-report-dialog');
@@ -3256,8 +3317,120 @@ async function executeBulkPrestaShopSync(actionableList) {
   prestashopBulkSuccessTimeout = setTimeout(finishAndUpdate, failCount > 0 ? 5500 : 2500);
 }
 
-async function openBulkTrackingSyncDialog() {
+function bulkTrackingSelection() {
   const selectedRows = controlRecords.filter((row) => controlSelectedTrackingNumbers.has(row.trackingNumber));
+  return {
+    selectedRows,
+    readyList: selectedRows.filter((row) => Boolean(row.orderReference || row.orderId)),
+    unlinkedList: selectedRows.filter((row) => !row.orderReference && !row.orderId),
+  };
+}
+
+function bulkTrackingRowOutcome(item, skipIfDifferent) {
+  const existingTracking = String(item.existingTracking || '').trim();
+  const tracking = String(item.trackingNumber || '').trim();
+  const hasConflict = Boolean(existingTracking && existingTracking !== tracking);
+  if (hasConflict && skipIfDifferent) return { kind: 'attention', label: 'Sarà saltato', detail: `Presente: ${existingTracking}` };
+  if (hasConflict) return { kind: 'attention', label: 'Da verificare', detail: `Presente: ${existingTracking}` };
+  if (existingTracking === tracking && tracking) return { kind: 'aligned', label: 'Già allineato', detail: '' };
+  return { kind: 'ready', label: 'Invia tracking', detail: '' };
+}
+
+function updateBulkTrackingDialog() {
+  const { readyList, unlinkedList } = bulkTrackingSelection();
+  const changeCarrier = Boolean($('#control-bulk-tracking-change-carrier')?.checked);
+  const updateState = Boolean($('#control-bulk-tracking-update-state')?.checked);
+  const skipIfDifferent = Boolean($('#control-bulk-tracking-skip-diff')?.checked);
+  const carrierSelect = $('#control-bulk-tracking-carrier');
+  const stateSelect = $('#control-bulk-tracking-state');
+  const invalidCarrier = changeCarrier && !carrierSelect?.value;
+  const invalidState = updateState && !stateSelect?.value;
+  const outcomes = readyList.map((item) => ({ item, outcome: bulkTrackingRowOutcome(item, skipIfDifferent) }));
+  const attentionCount = outcomes.filter(({ outcome }) => outcome.kind === 'attention').length;
+  const readyCount = readyList.length - attentionCount;
+
+  const summaryTitle = $('#control-bulk-tracking-summary-title');
+  if (summaryTitle) {
+    summaryTitle.textContent = attentionCount > 0
+      ? `${readyCount} pronte · ${attentionCount} da verificare`
+      : `${readyList.length} spedizion${readyList.length === 1 ? 'e pronta' : 'i pronte'}`;
+  }
+  $('#control-bulk-tracking-unlinked-count').textContent = String(unlinkedList.length);
+  $('#control-bulk-tracking-unlinked-note').hidden = unlinkedList.length === 0;
+  $('#control-bulk-filter-all-count').textContent = String(readyList.length);
+  $('#control-bulk-filter-ready-count').textContent = String(readyCount);
+  $('#control-bulk-filter-attention-count').textContent = String(attentionCount);
+
+  const summaryParts = [changeCarrier ? 'Il corriere verrà modificato' : 'Il corriere resterà invariato'];
+  summaryParts.push(updateState ? 'lo stato ordine verrà aggiornato' : 'lo stato ordine resterà invariato');
+  summaryParts.push(skipIfDifferent ? 'i tracking differenti sono protetti' : 'i tracking differenti richiedono attenzione');
+  $('#control-bulk-tracking-summary-text').textContent = `${summaryParts.join(' · ')}.`;
+
+  const advancedParts = [changeCarrier ? 'Corriere modificato' : 'Corriere invariato', updateState ? 'Stato aggiornato' : 'Stato invariato'];
+  $('#control-bulk-tracking-advanced-status').textContent = advancedParts.join(' · ');
+
+  const confirmLabel = $('#control-bulk-tracking-confirm-label');
+  if (confirmLabel) {
+    if (changeCarrier && updateState) confirmLabel.textContent = `Invia ${readyList.length} tracking, corriere e stato`;
+    else if (changeCarrier) confirmLabel.textContent = `Invia ${readyList.length} tracking e cambia corriere`;
+    else if (updateState) confirmLabel.textContent = `Invia ${readyList.length} tracking e aggiorna stato`;
+    else confirmLabel.textContent = `Invia ${readyList.length} tracking`;
+  }
+
+  const stateError = $('#control-bulk-tracking-state-error');
+  if (stateError) stateError.hidden = !invalidState;
+  stateSelect?.setAttribute('aria-invalid', String(invalidState));
+  carrierSelect?.setAttribute('aria-invalid', String(invalidCarrier));
+  const confirmBtn = $('#confirm-control-bulk-tracking');
+  if (confirmBtn) {
+    confirmBtn.disabled = readyList.length === 0 || invalidCarrier || invalidState;
+    confirmBtn.title = invalidState
+      ? 'Scegli uno stato PrestaShop per continuare'
+      : invalidCarrier
+        ? 'Scegli un corriere PrestaShop per continuare'
+        : 'Conferma invio tracking (Ctrl+Invio)';
+  }
+
+  document.querySelectorAll('#control-bulk-tracking-preview-filters button[data-filter]').forEach((button) => {
+    const active = button.dataset.filter === bulkTrackingPreviewFilter;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+
+  const filtered = outcomes.filter(({ outcome }) => {
+    if (bulkTrackingPreviewFilter === 'ready') return outcome.kind !== 'attention';
+    if (bulkTrackingPreviewFilter === 'attention') return outcome.kind === 'attention';
+    return true;
+  });
+  const previewList = $('#control-bulk-tracking-preview-list');
+  if (!previewList) return;
+  if (!readyList.length) {
+    previewList.innerHTML = '<div class="control-bulk-tracking-empty">Nessuna spedizione ha un ordine PrestaShop associato.</div>';
+    return;
+  }
+  if (!filtered.length) {
+    previewList.innerHTML = '<div class="control-bulk-tracking-empty">Nessuna spedizione in questo filtro.</div>';
+    return;
+  }
+  previewList.innerHTML = filtered.map(({ item, outcome }) => `
+    <div class="control-bulk-tracking-preview-row" role="row" data-outcome="${outcome.kind}">
+      <div class="control-bulk-preview-identity" role="cell">
+        <strong>${escapeHtml(item.orderReference || `ID #${item.orderId}`)}</strong>
+        <span>${escapeHtml(item.trackingNumber)}</span>
+      </div>
+      <div class="control-bulk-preview-state" role="cell">
+        ${item.currentState ? prestaShopBadge(item.currentState) : '<span class="status-pill status-pill-muted">Senza stato</span>'}
+      </div>
+      <div class="control-bulk-preview-outcome ${outcome.kind}" role="cell">
+        <strong>${escapeHtml(outcome.label)}</strong>
+        ${outcome.detail ? `<span>${escapeHtml(outcome.detail)}</span>` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+async function openBulkTrackingSyncDialog() {
+  const { selectedRows } = bulkTrackingSelection();
   if (!selectedRows.length) return;
 
   const dialog = $('#control-bulk-tracking-dialog');
@@ -3268,39 +3441,6 @@ async function openBulkTrackingSyncDialog() {
   $('#control-bulk-tracking-success-wrap').hidden = true;
   tell('#control-bulk-tracking-message', '', '');
 
-  const readyList = selectedRows.filter((row) => Boolean(row.orderReference || row.orderId));
-  const unlinkedList = selectedRows.filter((row) => !row.orderReference && !row.orderId);
-
-  const readyCountEl = $('#control-bulk-tracking-ready-count');
-  if (readyCountEl) readyCountEl.textContent = String(readyList.length);
-  const unlinkedCountEl = $('#control-bulk-tracking-unlinked-count');
-  if (unlinkedCountEl) unlinkedCountEl.textContent = String(unlinkedList.length);
-  const confirmNumEl = $('#control-bulk-tracking-confirm-num');
-  if (confirmNumEl) confirmNumEl.textContent = String(readyList.length);
-
-  const confirmBtn = $('#confirm-control-bulk-tracking');
-  if (confirmBtn) confirmBtn.disabled = readyList.length === 0;
-
-  const previewList = $('#control-bulk-tracking-preview-list');
-  if (previewList) {
-    if (readyList.length === 0) {
-      previewList.innerHTML = '<div style="padding: 14px; text-align: center; color: var(--muted); font-size: 0.78rem;">Nessuna spedizione selezionata ha un ordine PrestaShop associato. Associa prima gli ordini o seleziona altre righe.</div>';
-    } else {
-      previewList.innerHTML = readyList.map((item) => `
-        <div class="control-bulk-tracking-preview-row">
-          <div>
-            <strong>${escapeHtml(item.orderReference || `ID #${item.orderId}`)}</strong>
-            <span style="margin-left: 8px; color: var(--muted); font-family: monospace; font-size: 0.74rem;">${escapeHtml(item.trackingNumber)}</span>
-          </div>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            ${item.currentState ? prestaShopBadge(item.currentState) : '<span class="status-pill status-pill-muted">Senza stato</span>'}
-            ${item.isUnsynced ? '<span style="font-size: 0.68rem; color: #d97706; font-weight: 600;">● Non sincronizzato</span>' : '<span style="font-size: 0.68rem; color: #16a34a; font-weight: 600;">✓ Sincronizzato</span>'}
-          </div>
-        </div>
-      `).join('');
-    }
-  }
-
   if (!prestaShopCarrierCatalog || !prestaShopStateCatalog) {
     try {
       const cat = await request('/api/catalog');
@@ -3308,6 +3448,7 @@ async function openBulkTrackingSyncDialog() {
       prestaShopStateCatalog = cat.statuses || [];
     } catch (err) {
       console.warn('Impossibile caricare catalogo PrestaShop:', err);
+      tell('#control-bulk-tracking-message', 'Impossibile caricare corrieri e stati. L’invio del solo tracking resta disponibile.', 'warning');
     }
   }
 
@@ -3334,11 +3475,26 @@ async function openBulkTrackingSyncDialog() {
   const updateStateCheckbox = $('#control-bulk-tracking-update-state');
   if (updateStateCheckbox) {
     updateStateCheckbox.checked = false;
+    updateStateCheckbox.setAttribute('aria-expanded', 'false');
     const stateWrap = $('#control-bulk-tracking-state-wrap');
     if (stateWrap) stateWrap.hidden = true;
   }
   const skipDiffCheckbox = $('#control-bulk-tracking-skip-diff');
   if (skipDiffCheckbox) skipDiffCheckbox.checked = true;
+  const changeCarrierCheckbox = $('#control-bulk-tracking-change-carrier');
+  if (changeCarrierCheckbox) {
+    changeCarrierCheckbox.checked = false;
+    changeCarrierCheckbox.setAttribute('aria-expanded', 'false');
+  }
+  const carrierWrap = $('#control-bulk-tracking-carrier-wrap');
+  if (carrierWrap) carrierWrap.hidden = true;
+  if (carrierSelect) carrierSelect.disabled = true;
+  if (stateSelect) stateSelect.disabled = true;
+  const advanced = $('#control-bulk-tracking-advanced');
+  if (advanced) advanced.open = false;
+  bulkTrackingPreviewFilter = 'all';
+  bulkTrackingLastRetryItems = [];
+  updateBulkTrackingDialog();
 
   if (!dialog.open) dialog.showModal();
 }
@@ -3346,25 +3502,42 @@ async function openBulkTrackingSyncDialog() {
 async function executeBulkTrackingSync(actionableList) {
   if (!actionableList.length || bulkTrackingRunning) return;
 
-  const carrierId = $('#control-bulk-tracking-carrier')?.value;
-  if (!carrierId) {
+  const changeCarrier = Boolean($('#control-bulk-tracking-change-carrier')?.checked);
+  const carrierId = changeCarrier ? ($('#control-bulk-tracking-carrier')?.value || '') : '';
+  if (changeCarrier && !carrierId) {
     tell('#control-bulk-tracking-message', 'Seleziona un corriere prima di procedere.', 'error');
+    $('#control-bulk-tracking-carrier')?.focus();
     return;
   }
 
   const updateState = Boolean($('#control-bulk-tracking-update-state')?.checked);
   const targetStateId = updateState ? ($('#control-bulk-tracking-state')?.value || '') : '';
+  if (updateState && !targetStateId) {
+    tell('#control-bulk-tracking-message', 'Scegli lo stato PrestaShop da applicare prima di procedere.', 'error');
+    $('#control-bulk-tracking-state-error').hidden = false;
+    $('#control-bulk-tracking-state')?.focus();
+    updateBulkTrackingDialog();
+    return;
+  }
   const skipIfDifferent = Boolean($('#control-bulk-tracking-skip-diff')?.checked);
 
   bulkTrackingRunning = true;
+  bulkTrackingLastRetryItems = [];
   $('#control-bulk-tracking-form-wrap').hidden = true;
   $('#control-bulk-tracking-progress-wrap').hidden = false;
   $('#control-bulk-tracking-success-wrap').hidden = true;
+  const stopButton = $('#stop-control-bulk-tracking');
+  if (stopButton) {
+    stopButton.disabled = false;
+    stopButton.textContent = 'Interrompi operazione';
+  }
+  $('#control-bulk-tracking-progress-wrap')?.focus();
 
   const total = actionableList.length;
   let completed = 0;
   let successCount = 0;
   let skippedCount = 0;
+  let interrupted = false;
   const failedItems = [];
   const liveLog = $('#control-bulk-tracking-live-log');
   if (liveLog) liveLog.innerHTML = '';
@@ -3377,6 +3550,11 @@ async function executeBulkTrackingSync(actionableList) {
     if (percentEl) percentEl.textContent = `${percent}%`;
     const barEl = $('#control-bulk-tracking-progress-bar');
     if (barEl) barEl.style.width = `${percent}%`;
+    const trackEl = barEl?.parentElement;
+    if (trackEl) {
+      trackEl.setAttribute('aria-valuenow', String(percent));
+      trackEl.setAttribute('aria-valuetext', `${current} di ${total} completati`);
+    }
     const infoEl = $('#control-bulk-tracking-progress-info');
     if (infoEl) infoEl.textContent = infoText || '';
   };
@@ -3385,6 +3563,7 @@ async function executeBulkTrackingSync(actionableList) {
 
   for (let i = 0; i < actionableList.length; i++) {
     if (!bulkTrackingRunning) {
+      interrupted = true;
       if (liveLog) {
         const abortedItem = document.createElement('div');
         abortedItem.className = 'control-bulk-log-item error';
@@ -3405,7 +3584,8 @@ async function executeBulkTrackingSync(actionableList) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          carrierId,
+          carrierId: carrierId || undefined,
+          preserveCarrier: !changeCarrier,
           skipIfDifferent,
           overwrite: false,
           stateId: targetStateId || undefined,
@@ -3426,12 +3606,13 @@ async function executeBulkTrackingSync(actionableList) {
         if (liveLog) {
           const logEntry = document.createElement('div');
           logEntry.className = 'control-bulk-log-item success';
-          logEntry.innerHTML = `<span class="control-bulk-log-badge">INVIATO</span> <strong>${escapeHtml(orderRef)}:</strong> tracking inviato (${escapeHtml(tracking)}).`;
+          logEntry.innerHTML = `<span class="control-bulk-log-badge">INVIATO</span> <strong>${escapeHtml(orderRef)}:</strong> tracking inviato (${escapeHtml(tracking)})${changeCarrier ? ' con il nuovo corriere.' : '; corriere invariato.'}`;
           liveLog.prepend(logEntry);
         }
       }
     } catch (err) {
       failedItems.push({
+        item,
         tracking,
         orderReference: orderRef,
         error: err.message || 'Errore durante la sincronizzazione',
@@ -3453,6 +3634,11 @@ async function executeBulkTrackingSync(actionableList) {
   }
 
   bulkTrackingRunning = false;
+  const remainingCount = interrupted ? Math.max(0, total - completed) : 0;
+  bulkTrackingLastRetryItems = [
+    ...failedItems.map((failure) => failure.item),
+    ...(interrupted ? actionableList.slice(completed) : []),
+  ];
 
   $('#control-bulk-tracking-progress-wrap').hidden = true;
   $('#control-bulk-tracking-success-wrap').hidden = false;
@@ -3460,16 +3646,25 @@ async function executeBulkTrackingSync(actionableList) {
   const failCount = failedItems.length;
   const successTitle = $('#control-bulk-tracking-success-title');
   if (successTitle) {
-    successTitle.textContent = failCount === 0 && skippedCount === 0
+    successTitle.textContent = interrupted
+      ? `Operazione interrotta: ${completed} di ${total} elaborati`
+      : failCount === 0 && skippedCount === 0
       ? 'Tutti i tracking inviati con successo!'
       : `Elaborazione completata: ${successCount} inviati`;
+    successTitle.setAttribute('tabindex', '-1');
+    successTitle.focus();
   }
+
+  const successEyebrow = $('#control-bulk-tracking-success-eyebrow');
+  if (successEyebrow) successEyebrow.textContent = interrupted ? 'Operazione interrotta' : failCount > 0 ? 'Completata con errori' : 'Operazione completata';
 
   const successDesc = $('#control-bulk-tracking-success-desc');
   if (successDesc) {
     let msg = `Operazione terminata su ${completed} ordin${completed === 1 ? 'e' : 'i'}.`;
+    if (successCount > 0) msg += changeCarrier ? ' Il corriere selezionato è stato associato agli ordini aggiornati.' : ' I corrieri esistenti sono rimasti invariati.';
     if (skippedCount > 0) msg += ` ${skippedCount} saltati per protezione anti-sovrascrittura.`;
     if (failCount > 0) msg += ` ${failCount} errori riscontrati (le righe restano selezionate per consentirti di verificare).`;
+    if (remainingCount > 0) msg += ` ${remainingCount} non elaborati: puoi riprendere dal punto di interruzione.`;
     successDesc.textContent = msg;
   }
 
@@ -3488,6 +3683,7 @@ async function executeBulkTrackingSync(actionableList) {
         <strong>${failCount}</strong>
         <span>Errori</span>
       </div>
+      ${remainingCount > 0 ? `<div class="control-bulk-kpi-box pending"><strong>${remainingCount}</strong><span>Non elaborati</span></div>` : ''}
     `;
   }
 
@@ -3502,10 +3698,16 @@ async function executeBulkTrackingSync(actionableList) {
     }
   }
 
+  const retryButton = $('#control-bulk-tracking-retry-btn');
+  if (retryButton) {
+    retryButton.hidden = bulkTrackingLastRetryItems.length === 0;
+    retryButton.textContent = interrupted ? `Riprendi ${bulkTrackingLastRetryItems.length} non elaborati` : `Riprova ${bulkTrackingLastRetryItems.length} non riusciti`;
+  }
+
   const finishAndUpdate = async () => {
     const dialog = $('#control-bulk-tracking-dialog');
     if (dialog?.open) dialog.close();
-    showFloatingToast(`${successCount} tracking sincronizzat${successCount === 1 ? 'o' : 'i'} su PrestaShop`, failCount === 0 ? 'success' : 'warning');
+    showFloatingToast(`${successCount} tracking sincronizzat${successCount === 1 ? 'o' : 'i'} su PrestaShop`, failCount === 0 && !interrupted ? 'success' : 'warning');
     await refreshControlCenter();
   };
 
@@ -5242,14 +5444,6 @@ $('.control-center-card').addEventListener('click', (event) => {
       controlUnsyncedFilter = false;
     }
   }
-  controlPage = 1;
-  refreshControlCenter();
-});
-$('.control-center-card').addEventListener('change', (event) => {
-  if (!event.target.matches('#control-other-status') || !event.target.value) return;
-  $('#control-raben-filter').value = event.target.value;
-  $('#control-exceptions').checked = false;
-  controlMetricFilter = 'all';
   controlPage = 1;
   refreshControlCenter();
 });

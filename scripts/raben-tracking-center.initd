@@ -1,0 +1,52 @@
+#!/sbin/openrc-run
+# Service script for Raben - Tracking Center on Alpine Linux
+
+name="raben-tracking-center"
+description="Raben PrestaShop Tracking Center Service"
+
+: ${Raben_USER:="raben"}
+: ${Raben_GROUP:="raben"}
+: ${Raben_DIR:="/opt/raben-tracking-center"}
+: ${Raben_PORT:=3000}
+: ${NODE_BIN:="/usr/bin/node"}
+
+directory="${Raben_DIR}"
+command="${NODE_BIN}"
+command_args="src/server.js"
+command_user="${Raben_USER}:${Raben_GROUP}"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.err"
+
+export PORT="${Raben_PORT}"
+export NODE_ENV="production"
+
+depend() {
+    need net
+    after firewall
+    use camofox
+}
+
+start_pre() {
+    # Verify node binary exists
+    if [ ! -x "${NODE_BIN}" ]; then
+        eerror "Node.js binary non trovato in ${NODE_BIN}"
+        return 1
+    fi
+
+    # Verify project directory exists
+    if [ ! -d "${Raben_DIR}" ]; then
+        eerror "Directory del progetto ${Raben_DIR} non trovata"
+        return 1
+    fi
+
+    # Ensure log files and data directory exist with correct permissions
+    checkpath -d -m 0755 -o "${command_user}" /var/log
+    checkpath -f -m 0644 -o "${command_user}" "${output_log}" "${error_log}"
+    checkpath -d -m 0755 -o "${command_user}" "${Raben_DIR}/data"
+
+    if [ -f "${Raben_DIR}/.env" ]; then
+        export $(grep -v '^#' "${Raben_DIR}/.env" | xargs)
+    fi
+}

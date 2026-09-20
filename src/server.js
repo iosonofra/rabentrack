@@ -785,16 +785,14 @@ app.post('/api/control-center/:trackingNumber/sync-prestashop', async (req, res)
     }
     if (!orderId) throw new Error('Impossibile determinare l’ordine PrestaShop collegato a questa spedizione.');
 
-    const carriers = await shop.listCarriers();
-    let carrierId = req.body?.carrierId ? String(req.body.carrierId).trim() : connection.defaultCarrierId;
-    if (!carrierId) {
+    const preserveCarrier = Boolean(req.body?.preserveCarrier);
+    const carriers = preserveCarrier ? await shop.listCarriers().catch(() => []) : await shop.listCarriers();
+    let carrierId = preserveCarrier ? '' : (req.body?.carrierId ? String(req.body.carrierId).trim() : connection.defaultCarrierId);
+    if (!preserveCarrier && !carrierId) {
       const rabenCarrier = carriers.find((c) => /raben|schenker/i.test(c.name));
       carrierId = rabenCarrier ? rabenCarrier.id : (carriers[0]?.id || '');
     }
-    if (!carrierId) throw new Error('Nessun corriere attivo trovato su PrestaShop per l’associazione.');
-
-    const targetCarrier = carriers.find((c) => String(c.id) === String(carrierId));
-    const carrierName = targetCarrier ? targetCarrier.name : `Corriere #${carrierId}`;
+    if (!preserveCarrier && !carrierId) throw new Error('Nessun corriere attivo trovato su PrestaShop per l’associazione.');
 
     const overwrite = Boolean(req.body?.overwrite);
     const skipIfDifferent = Boolean(req.body?.skipIfDifferent);
@@ -817,16 +815,20 @@ app.post('/api/control-center/:trackingNumber/sync-prestashop', async (req, res)
       }
     }
 
-    if (req.body?.setAsDefaultCarrier || !connection.defaultCarrierId) {
+    const effectiveCarrierId = String(outcome?.carrierId || carrierId || '').trim();
+    const targetCarrier = carriers.find((c) => String(c.id) === effectiveCarrierId);
+    const carrierName = targetCarrier ? targetCarrier.name : (preserveCarrier ? '' : `Corriere #${effectiveCarrierId}`);
+
+    if (!preserveCarrier && (req.body?.setAsDefaultCarrier || !connection.defaultCarrierId)) {
       connection.defaultCarrierId = carrierId;
       connection.defaultCarrierName = carrierName;
       await saveSettings(connection);
     }
 
-    const updated = await syncShipmentPrestaShopShipping(shipment.trackingNumber, {
+    const updated = skipped ? shipment : await syncShipmentPrestaShopShipping(shipment.trackingNumber, {
       orderId,
       orderReference: shipment.orderReference,
-      carrierId,
+      carrierId: effectiveCarrierId,
       carrierName,
       overwritten: Boolean(outcome?.overwritten),
     });
@@ -849,8 +851,8 @@ app.post('/api/control-center/:trackingNumber/sync-prestashop', async (req, res)
       message: skipped
         ? 'Tracking già presente su PrestaShop, spedizione saltata senza sovrascrittura.'
         : outcome.overwritten
-          ? `Tracking sovrascritto e corriere impostato su “${carrierName}”.`
-          : `Tracking importato e corriere impostato su “${carrierName}”.`,
+          ? preserveCarrier ? 'Tracking sovrascritto senza modificare il corriere.' : `Tracking sovrascritto e corriere impostato su “${carrierName}”.`
+          : preserveCarrier ? 'Tracking importato senza modificare il corriere.' : `Tracking importato e corriere impostato su “${carrierName}”.`,
       shipment: updated,
       outcome,
       stateOutcome,
@@ -869,15 +871,16 @@ app.post('/api/control-center/bulk-sync-tracking', async (req, res) => {
 
     const shop = client();
     const carriers = await shop.listCarriers().catch(() => []);
-    let carrierId = req.body?.carrierId ? String(req.body.carrierId).trim() : connection.defaultCarrierId;
-    if (!carrierId && carriers.length) {
+    const preserveCarrier = Boolean(req.body?.preserveCarrier);
+    let carrierId = preserveCarrier ? '' : (req.body?.carrierId ? String(req.body.carrierId).trim() : connection.defaultCarrierId);
+    if (!preserveCarrier && !carrierId && carriers.length) {
       const rabenCarrier = carriers.find((c) => /raben|schenker/i.test(c.name));
       carrierId = rabenCarrier ? rabenCarrier.id : carriers[0].id;
     }
-    if (!carrierId) throw new Error('Nessun corriere attivo trovato su PrestaShop per l’associazione.');
+    if (!preserveCarrier && !carrierId) throw new Error('Nessun corriere attivo trovato su PrestaShop per l’associazione.');
 
     const targetCarrier = carriers.find((c) => String(c.id) === String(carrierId));
-    const carrierName = targetCarrier ? targetCarrier.name : `Corriere #${carrierId}`;
+    const carrierName = targetCarrier ? targetCarrier.name : (preserveCarrier ? 'Corriere esistente' : `Corriere #${carrierId}`);
 
     const overwrite = Boolean(req.body?.overwrite);
     const skipIfDifferent = Boolean(req.body?.skipIfDifferent ?? !overwrite);
@@ -916,13 +919,19 @@ app.post('/api/control-center/bulk-sync-tracking', async (req, res) => {
           }
         }
 
-        await syncShipmentPrestaShopShipping(shipment.trackingNumber, {
-          orderId,
-          orderReference: shipment.orderReference,
-          carrierId,
-          carrierName,
-          overwritten: Boolean(outcome?.overwritten),
-        });
+        const effectiveCarrierId = String(outcome?.carrierId || carrierId || '').trim();
+        const effectiveCarrier = carriers.find((candidate) => String(candidate.id) === effectiveCarrierId);
+        const effectiveCarrierName = effectiveCarrier ? effectiveCarrier.name : (preserveCarrier ? '' : carrierName);
+
+        if (!skipped) {
+          await syncShipmentPrestaShopShipping(shipment.trackingNumber, {
+            orderId,
+            orderReference: shipment.orderReference,
+            carrierId: effectiveCarrierId,
+            carrierName: effectiveCarrierName,
+            overwritten: Boolean(outcome?.overwritten),
+          });
+        }
 
         if (targetStateId) {
           await shop.applyOrderStateSafely({ orderId, stateId: targetStateId });
@@ -944,8 +953,8 @@ app.post('/api/control-center/bulk-sync-tracking', async (req, res) => {
           detail: skipped
             ? 'Tracking già presente su PrestaShop (non sovrascritto)'
             : outcome?.overwritten
-              ? `Tracking sovrascritto (Corriere: ${carrierName})`
-              : `Tracking inviato (Corriere: ${carrierName})`,
+              ? preserveCarrier ? 'Tracking sovrascritto; corriere invariato' : `Tracking sovrascritto (Corriere: ${effectiveCarrierName})`
+              : preserveCarrier ? 'Tracking inviato; corriere invariato' : `Tracking inviato (Corriere: ${effectiveCarrierName})`,
         });
       } catch (err) {
         results.push({
@@ -965,7 +974,7 @@ app.post('/api/control-center/bulk-sync-tracking', async (req, res) => {
       successfulCount,
       skippedCount,
       failedCount,
-      carrierName,
+      carrierName: preserveCarrier ? 'Invariato' : carrierName,
       results,
     });
   } catch (error) {

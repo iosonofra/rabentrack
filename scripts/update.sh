@@ -20,6 +20,18 @@ echo "${YELLOW}==> 1/3 Scaricamento ultimi aggiornamenti da GitHub...${NC}"
 git pull
 
 echo "${YELLOW}==> 2/3 Aggiornamento dipendenze...${NC}"
+
+if ! command -v make >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+        echo "Installazione strumenti di compilazione richiesti dai moduli Node.js nativi..."
+        apt-get update
+        apt-get install -y --no-install-recommends python3 build-essential
+    else
+        echo "Errore: servono Python 3, make e un compilatore C++. Esegui come root: apt-get install -y python3 build-essential" >&2
+        exit 1
+    fi
+fi
+
 npm ci --omit=dev || npm install --omit=dev
 
 if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then

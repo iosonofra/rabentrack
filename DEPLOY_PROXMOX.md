@@ -118,6 +118,7 @@ Lo script installa:
 - Node.js 22 LTS; il progetto richiede almeno Node.js 20;
 - librerie GTK, NSS, X11, audio, D-Bus e font richieste dal browser;
 - Xvfb per l'esecuzione headless;
+- strumenti di compilazione `python3` e `build-essential`, necessari quando un modulo Node.js nativo come `better-sqlite3` non dispone di un binario precompilato;
 - dipendenze npm di produzione;
 - binario Camoufox tramite `camoufox-js`;
 - utente di sistema `raben`;
