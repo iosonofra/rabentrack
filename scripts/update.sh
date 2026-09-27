@@ -16,8 +16,13 @@ cd "${APP_DIR}"
 
 echo "${BLUE}${BOLD}Aggiornamento Raben - Tracking Center...${NC}"
 
-echo "${YELLOW}==> 1/3 Scaricamento ultimi aggiornamenti da GitHub...${NC}"
-git pull
+echo "${YELLOW}==> 1/3 Verifica sorgenti e aggiornamenti...${NC}"
+if [ -d ".git" ]; then
+    echo "Scaricamento ultimi aggiornamenti da Git..."
+    git pull || true
+else
+    echo "Nessun repository Git rilevato: applicazione aggiornamento dai file locali estratti."
+fi
 
 echo "${YELLOW}==> 2/3 Aggiornamento dipendenze...${NC}"
 
@@ -44,6 +49,7 @@ chown -R raben:raben "${APP_DIR}" 2>/dev/null || true
 
 echo "${YELLOW}==> 3/3 Riavvio dei servizi...${NC}"
 if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
     if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then
         systemctl restart camofox || true
         echo "${GREEN}Servizio Camofox riavviato.${NC}"

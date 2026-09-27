@@ -273,7 +273,7 @@ export function isShipmentTrackingUnsynced(record) {
   return true;
 }
 
-export async function getControlCenter({ query = '', status = '', rabenStatus = '', prestaState = '', unsynced = false, checkedAfter = '', exceptionOnly = false, archived = false, page = 1, pageSize = 50 } = {}) {
+export async function getControlCenter({ query = '', status = '', rabenStatus = '', prestaState = '', unsynced = false, checkedAfter = '', exceptionOnly = false, archived = false, checkSort = 'desc', page = 1, pageSize = 50 } = {}) {
   const db = await load();
   const needle = String(query).trim().toLocaleLowerCase('it-IT');
   const isArchivedView = archived === true || archived === '1' || archived === 'true' || rabenStatus === 'Archiviate';
@@ -315,12 +315,22 @@ export async function getControlCenter({ query = '', status = '', rabenStatus = 
     return output;
   }, {});
   const normalizedPrestaState = String(prestaState || '').trim();
+  const sortDirection = String(checkSort || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
   const filtered = filteredWithoutPrestaState.filter((record) => {
     if (!normalizedPrestaState) return true;
     if (normalizedPrestaState === '__unlinked__') return !record.orderId;
     if (normalizedPrestaState === '__unavailable__') return Boolean(record.orderId) && !String(record.currentState || '').trim();
     return String(record.currentState || '').trim().toLocaleLowerCase('it-IT') === normalizedPrestaState.toLocaleLowerCase('it-IT');
-  }).sort((a, b) => String(b.lastSeenAt).localeCompare(String(a.lastSeenAt)));
+  }).sort((a, b) => {
+    const timeA = String(a.rabenCheckedAt || a.lastSeenAt || '');
+    const timeB = String(b.rabenCheckedAt || b.lastSeenAt || '');
+    if (!timeA && !timeB) return String(a.trackingNumber || '').localeCompare(String(b.trackingNumber || ''));
+    if (!timeA) return 1;
+    if (!timeB) return -1;
+    const cmp = sortDirection === 'asc' ? timeA.localeCompare(timeB) : timeB.localeCompare(timeA);
+    if (cmp !== 0) return cmp;
+    return String(a.trackingNumber || '').localeCompare(String(b.trackingNumber || ''));
+  });
 
   const counts = activeRecords.reduce((output, record) => {
     output[record.operationalStatus] = (output[record.operationalStatus] || 0) + 1;
@@ -347,6 +357,7 @@ export async function getControlCenter({ query = '', status = '', rabenStatus = 
     page: normalizedPage,
     pageSize: normalizedPageSize,
     totalPages,
+    checkSort: sortDirection,
     records: filtered.slice(offset, offset + normalizedPageSize),
   };
 }

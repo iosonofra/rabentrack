@@ -12,6 +12,7 @@ let controlRecords = [];
 let controlPage = 1;
 let controlMetricFilter = 'all';
 let controlPrestaStateFilter = '';
+let controlCheckSort = 'desc';
 const PRESTA_UNLINKED_FILTER = '__unlinked__';
 const PRESTA_UNAVAILABLE_FILTER = '__unavailable__';
 const CONTROL_PAGE_SIZE = 50;
@@ -669,6 +670,61 @@ function renderControlPrestaFilter(data) {
   positionControlPrestaFilter();
 }
 
+function closeControlCheckSortMenu() {
+  const menu = $('#control-check-sort-menu');
+  const trigger = $('#control-check-sort-trigger');
+  if (menu) menu.hidden = true;
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+}
+
+function positionControlCheckSortMenu() {
+  const menu = $('#control-check-sort-menu');
+  const trigger = $('#control-check-sort-trigger');
+  if (!menu || !trigger || menu.hidden) return;
+  const rect = trigger.getBoundingClientRect();
+  const width = Math.min(280, window.innerWidth - 24);
+  menu.style.width = `${width}px`;
+  menu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - width - 12))}px`;
+  menu.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - menu.offsetHeight - 12)}px`;
+}
+
+function renderControlCheckSort() {
+  const menu = $('#control-check-sort-menu');
+  const trigger = $('#control-check-sort-trigger');
+  if (!trigger) return;
+  const isAsc = controlCheckSort === 'asc';
+  trigger.classList.toggle('active', isAsc);
+  trigger.title = isAsc
+    ? 'Ordinamento: dal più vecchio al più recente (clicca per modificare)'
+    : 'Ordinamento: dal più recente al più vecchio (clicca per modificare)';
+
+  trigger.innerHTML = `
+    <span id="control-check-sort-label">${isAsc ? 'Ultimo controllo (meno recenti)' : 'Ultimo controllo'}</span>
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="m4 6 4 4 4-4"/>
+    </svg>
+  `;
+
+  if (!menu) return;
+  menu.innerHTML = `
+    <div class="control-column-filter-heading">
+      <strong>Ultimo controllo</strong>
+      <span>Ordinamento</span>
+    </div>
+    <div class="control-column-filter-options">
+      <button type="button" class="control-column-filter-option${!isAsc ? ' active' : ''}" data-check-sort="desc" role="menuitemradio" aria-checked="${!isAsc}">
+        <span>Dal più recente al più vecchio</span>
+        ${!isAsc ? '<strong><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg></strong>' : ''}
+      </button>
+      <button type="button" class="control-column-filter-option${isAsc ? ' active' : ''}" data-check-sort="asc" role="menuitemradio" aria-checked="${isAsc}">
+        <span>Dal vecchio al più recente</span>
+        ${isAsc ? '<strong><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg></strong>' : ''}
+      </button>
+    </div>
+  `;
+  positionControlCheckSortMenu();
+}
+
 function renderControlCenter(data) {
   controlOverview = data;
   rabenStateMappings = data.stateMappings || rabenStateMappings;
@@ -677,6 +733,16 @@ function renderControlCenter(data) {
   let batchBanner = $('#control-batch-banner');
   if (batchMode) {
     controlRecords = controlRecords.filter((row) => activeBatchFilter.trackings.has(row.trackingNumber));
+    controlRecords.sort((a, b) => {
+      const timeA = String(a.rabenCheckedAt || a.lastSeenAt || '');
+      const timeB = String(b.rabenCheckedAt || b.lastSeenAt || '');
+      if (!timeA && !timeB) return String(a.trackingNumber || '').localeCompare(String(b.trackingNumber || ''));
+      if (!timeA) return 1;
+      if (!timeB) return -1;
+      const cmp = controlCheckSort === 'asc' ? timeA.localeCompare(timeB) : timeB.localeCompare(timeA);
+      if (cmp !== 0) return cmp;
+      return String(a.trackingNumber || '').localeCompare(String(b.trackingNumber || ''));
+    });
     if (!batchBanner) {
       batchBanner = document.createElement('div');
       batchBanner.id = 'control-batch-banner';
@@ -715,6 +781,7 @@ function renderControlCenter(data) {
   renderRabenStatusFilters(data.rabenCounts || {}, data.archivedCount || 0, attention, unsyncedCount);
   renderControlMappingAlert(data.rabenCounts || {});
   renderControlPrestaFilter(data);
+  renderControlCheckSort();
   const unsyncedCountEl = $('#control-unsynced-count');
   if (unsyncedCountEl) unsyncedCountEl.textContent = unsyncedCount;
   const unsyncedBtn = $('#control-filter-unsynced');
@@ -1245,6 +1312,7 @@ async function refreshControlCenter() {
   if (query) params.set('query', query);
   if ($('#control-raben-filter')?.value) params.set('rabenStatus', $('#control-raben-filter').value);
   if (controlPrestaStateFilter) params.set('prestaState', controlPrestaStateFilter);
+  if (controlCheckSort) params.set('checkSort', controlCheckSort);
   if ($('#control-date-filter')?.value) params.set('checkedAfter', $('#control-date-filter').value);
   if ($('#control-exceptions').checked) params.set('exceptions', '1');
   if (controlUnsyncedFilter) params.set('unsynced', '1');
@@ -1254,7 +1322,9 @@ async function refreshControlCenter() {
   params.set('pageSize', activeBatchFilter ? '500' : String(CONTROL_PAGE_SIZE));
   try {
     renderControlCenter(await request(`/api/control-center?${params}`));
-    $('#control-last-sync').textContent = `Elenco aggiornato alle ${new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}`;
+    const timeStr = new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+    const isAsc = controlCheckSort === 'asc';
+    $('#control-last-sync').innerHTML = `Elenco aggiornato alle ${timeStr} · <span class="control-sync-sort-info ${isAsc ? 'asc' : 'desc'}">${isAsc ? '↑ Meno recenti prima' : '↓ Più recenti prima'}</span>`;
   }
   catch (e) { $('#control-table tbody').innerHTML = `<tr><td colspan="8" class="control-empty">${escapeHtml(e.message)}</td></tr>`; }
 }
@@ -1710,13 +1780,55 @@ function settingsStatus(kind, state, label, detail, action) {
   const item = $(`[data-health-item="${kind}"]`);
   if (!item) return;
   item.dataset.state = state;
+  item.dataset.settingsTarget = action.target;
+  const labelEl = item.querySelector('strong');
+  const itemName = labelEl ? labelEl.textContent.trim() : label;
+  item.title = `Vai a ${itemName}`;
   item.querySelector('.settings-health-state').textContent = label;
   item.querySelector('.settings-health-detail').textContent = detail;
   const button = item.querySelector('button');
   if (button) {
     button.textContent = action.label;
     button.dataset.settingsTarget = action.target;
+    button.tabIndex = -1;
   }
+}
+function navigateToSettingsHealthItem(kind) {
+  const targetMap = {
+    prestashop: { section: 'connections', cardSelector: '.settings-connection-card' },
+    camofox: { section: 'connections', cardSelector: '.settings-camofox-card, #raben-beta' },
+    automation: { section: 'automation', cardSelector: '.cron-card' },
+    mappings: { section: 'mappings', cardSelector: '#state-mapping-view' },
+    notifications: { section: 'notifications', cardSelector: '#notification-settings-view' },
+  };
+
+  const targetInfo = targetMap[kind];
+  if (!targetInfo) return;
+
+  try {
+    window.history.replaceState(null, '', `#settings/${targetInfo.section}`);
+  } catch {}
+
+  activateSettingsSection(targetInfo.section, { scroll: false });
+
+  requestAnimationFrame(() => {
+    const targetCard = document.querySelector(targetInfo.cardSelector);
+    if (!targetCard) return;
+
+    if (typeof targetCard.scrollIntoView === 'function') {
+      targetCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      targetCard.scrollIntoView(true);
+    }
+
+    targetCard.classList.remove('settings-card-highlight');
+    void targetCard.offsetWidth;
+    targetCard.classList.add('settings-card-highlight');
+
+    setTimeout(() => {
+      targetCard.classList.remove('settings-card-highlight');
+    }, 1900);
+  });
 }
 
 function updateSettingsHealth() {
@@ -1765,7 +1877,13 @@ function activateSettingsSection(section, { scroll = true, behavior = 'smooth' }
   document.querySelectorAll('[data-settings-section]').forEach((element) => element.classList.toggle('settings-section-active', element.dataset.settingsSection === section));
   if (scroll) {
     const target = document.querySelector(`[data-settings-section="${section}"]`);
-    target?.scrollIntoView({ behavior, block: 'start' });
+    if (target) {
+      if (typeof target.scrollIntoView === 'function') {
+        target.scrollIntoView({ behavior, block: 'start' });
+      } else {
+        target.scrollIntoView(true);
+      }
+    }
   }
 }
 
@@ -2074,7 +2192,7 @@ function setupWorkspace() {
         ['automation', 'Automazione', 'automation'],
         ['mappings', 'Mappature', 'mappings'],
         ['notifications', 'Notifiche', 'notifications'],
-      ].map(([kind, label, target]) => `<article class="settings-health-item" data-health-item="${kind}" data-state="off"><span class="settings-health-dot" aria-hidden="true"></span><div><strong>${label}</strong><span class="settings-health-state">Non configurato</span><small class="settings-health-detail">Verifica richiesta</small></div><button type="button" class="settings-health-action" data-settings-target="${target}">Configura</button></article>`).join('')}
+      ].map(([kind, label, target]) => `<article class="settings-health-item" data-health-item="${kind}" data-settings-target="${target}" data-state="off" role="button" tabindex="0" title="Vai alla sezione ${label}"><span class="settings-health-dot" aria-hidden="true"></span><div><strong>${label}</strong><span class="settings-health-state">Non configurato</span><small class="settings-health-detail">Verifica richiesta</small></div><button type="button" class="settings-health-action" data-settings-target="${target}" tabindex="-1">Configura</button></article>`).join('')}
     </div>
   `;
 
@@ -2124,15 +2242,42 @@ function setupWorkspace() {
   sectionNav.addEventListener('click', (event) => {
     const button = event.target.closest('[data-settings-nav]');
     if (button) {
-      history.replaceState(null, '', `#settings/${button.dataset.settingsNav}`);
+      try { window.history.replaceState(null, '', `#settings/${button.dataset.settingsNav}`); } catch {}
       activateSettingsSection(button.dataset.settingsNav);
     }
   });
+  overview.addEventListener('click', (event) => {
+    const healthItem = event.target.closest('[data-health-item]');
+    if (healthItem) {
+      event.preventDefault();
+      navigateToSettingsHealthItem(healthItem.dataset.healthItem);
+    }
+  });
+  overview.addEventListener('keydown', (event) => {
+    const healthItem = event.target.closest('[data-health-item]');
+    if (healthItem && (event.key === 'Enter' || event.key === ' ')) {
+      event.preventDefault();
+      navigateToSettingsHealthItem(healthItem.dataset.healthItem);
+    }
+  });
   settingsDashboard.addEventListener('click', (event) => {
+    const healthItem = event.target.closest('[data-health-item]');
+    if (healthItem) {
+      event.preventDefault();
+      navigateToSettingsHealthItem(healthItem.dataset.healthItem);
+      return;
+    }
     const target = event.target.closest('[data-settings-target]');
     if (target) {
-      history.replaceState(null, '', `#settings/${target.dataset.settingsTarget}`);
+      try { window.history.replaceState(null, '', `#settings/${target.dataset.settingsTarget}`); } catch {}
       activateSettingsSection(target.dataset.settingsTarget);
+    }
+  });
+  settingsDashboard.addEventListener('keydown', (event) => {
+    const healthItem = event.target.closest('[data-health-item]');
+    if (healthItem && (event.key === 'Enter' || event.key === ' ')) {
+      event.preventDefault();
+      navigateToSettingsHealthItem(healthItem.dataset.healthItem);
     }
   });
   settingsDashboard.addEventListener('input', (event) => {
@@ -2152,9 +2297,9 @@ function setupWorkspace() {
   activateSettingsSection('connections', { scroll: false });
   updateCronImpactPreview();
   updateSettingsHealth();
-  const history = document.createElement('section');
-  history.className = 'card workspace-view'; history.dataset.view = 'history'; history.id = 'history-view'; history.hidden = true;
-  history.innerHTML = `
+  const historySection = document.createElement('section');
+  historySection.className = 'card workspace-view'; historySection.dataset.view = 'history'; historySection.id = 'history-view'; historySection.hidden = true;
+  historySection.innerHTML = `
     <div class="control-heading history-heading">
       <div>
         <p class="eyebrow">TRACCIABILITÀ & AUDIT</p>
@@ -2243,7 +2388,7 @@ function setupWorkspace() {
       </form>
     </dialog>
   `;
-  main.append(history);
+  main.append(historySection);
   const icons = {
     control: '<svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 10h16M9 10v9"/></svg>',
     import: '<svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>',
@@ -2312,6 +2457,13 @@ function setupControlWorkspace() {
     prestaHeader.innerHTML = '<button id="control-presta-filter-trigger" type="button" class="control-column-filter-trigger" aria-haspopup="menu" aria-expanded="false"><span id="control-presta-filter-label">Stato PrestaShop</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>';
   }
   if (!$('#control-presta-filter-menu')) document.body.insertAdjacentHTML('beforeend', '<div id="control-presta-filter-menu" class="control-column-filter-menu" role="menu" aria-label="Filtra per stato PrestaShop" hidden></div>');
+  const checkHeader = [...card.querySelectorAll('#control-table thead th')].find((cell) => cell.textContent.trim().startsWith('Ultimo controllo'));
+  if (checkHeader) {
+    checkHeader.classList.add('control-filterable-header');
+    checkHeader.innerHTML = '<button id="control-check-sort-trigger" type="button" class="control-column-filter-trigger" aria-haspopup="menu" aria-expanded="false"></button>';
+  }
+  if (!$('#control-check-sort-menu')) document.body.insertAdjacentHTML('beforeend', '<div id="control-check-sort-menu" class="control-column-filter-menu" role="menu" aria-label="Ordina per data ultimo controllo" hidden></div>');
+  renderControlCheckSort();
   const initialEmptyCell = card.querySelector('#control-table tbody .control-empty');
   if (initialEmptyCell) initialEmptyCell.colSpan = card.querySelectorAll('#control-table thead th').length;
   card.querySelector('.control-heading > div').insertAdjacentHTML('beforeend', '<div class="control-meta"><span id="control-service-status" class="control-service-status" data-state="off">Raben tracking non attivo</span><span id="control-last-sync" class="control-last-sync" aria-live="polite"></span></div>');
@@ -2335,6 +2487,9 @@ function setupControlWorkspace() {
     controlMetricFilter = 'all';
     controlPrestaStateFilter = '';
     closeControlPrestaFilter();
+    controlCheckSort = 'desc';
+    closeControlCheckSortMenu();
+    showFloatingToast('Filtri azzerati: ripristinato ordinamento dal più recente', 'info');
     controlPage = 1;
     refreshControlCenter();
   });
@@ -3760,7 +3915,7 @@ function showView(requestedView) {
   if (activeView === 'settings' && view !== 'settings' && dirtySettingsSections.size) {
     const sections = [...dirtySettingsSections].map((section) => settingsSectionLabels[section]).join(', ');
     if (!confirm(`Hai modifiche non salvate in: ${sections}.\n\nVuoi uscire senza salvarle?`)) {
-      history.replaceState(null, '', '#settings');
+      try { window.history.replaceState(null, '', '#settings'); } catch {}
       return;
     }
     dirtySettingsSections.clear();
@@ -3789,7 +3944,11 @@ function showView(requestedView) {
     void loadCronStatus();
     void loadNotificationSettings();
     updateSettingsHealth();
-    if (settingsSectionLabels[requestedSettingsSection]) requestAnimationFrame(() => activateSettingsSection(requestedSettingsSection, { behavior: 'auto' }));
+    if (requestedSettingsSection === 'camofox' || requestedSettingsSection === 'prestashop') {
+      requestAnimationFrame(() => navigateToSettingsHealthItem(requestedSettingsSection));
+    } else if (settingsSectionLabels[requestedSettingsSection]) {
+      requestAnimationFrame(() => activateSettingsSection(requestedSettingsSection, { behavior: 'auto' }));
+    }
   }
 }
 
@@ -5527,6 +5686,7 @@ document.addEventListener('click', (event) => {
   const trigger = event.target.closest('#control-presta-filter-trigger');
   const menu = $('#control-presta-filter-menu');
   if (trigger && menu) {
+    closeControlCheckSortMenu();
     const willOpen = menu.hidden;
     menu.hidden = !willOpen;
     trigger.setAttribute('aria-expanded', String(willOpen));
@@ -5542,16 +5702,60 @@ document.addEventListener('click', (event) => {
     return;
   }
   if (menu && !menu.hidden && !event.target.closest('#control-presta-filter-menu')) closeControlPrestaFilter();
+
+  const checkTrigger = event.target.closest('#control-check-sort-trigger');
+  const checkMenu = $('#control-check-sort-menu');
+  if (checkTrigger && checkMenu) {
+    closeControlPrestaFilter();
+    const willOpen = checkMenu.hidden;
+    checkMenu.hidden = !willOpen;
+    checkTrigger.setAttribute('aria-expanded', String(willOpen));
+    if (willOpen) requestAnimationFrame(positionControlCheckSortMenu);
+    return;
+  }
+  const checkOption = event.target.closest('#control-check-sort-menu [data-check-sort]');
+  if (checkOption) {
+    const selectedSort = checkOption.dataset.checkSort || 'desc';
+    closeControlCheckSortMenu();
+    if (selectedSort !== controlCheckSort) {
+      controlCheckSort = selectedSort;
+      controlPage = 1;
+      const isAsc = controlCheckSort === 'asc';
+      showFloatingToast(
+        isAsc
+          ? 'Ordinamento: dal più vecchio al più recente (meno recenti in cima)'
+          : 'Ordinamento: dal più recente al più vecchio (più recenti in cima)',
+        isAsc ? 'warning' : 'success'
+      );
+      refreshControlCenter();
+    }
+    return;
+  }
+  if (checkMenu && !checkMenu.hidden && !event.target.closest('#control-check-sort-menu')) {
+    closeControlCheckSortMenu();
+  }
 });
 
 document.addEventListener('keydown', (event) => {
-  if (event.key !== 'Escape' || $('#control-presta-filter-menu')?.hidden) return;
-  closeControlPrestaFilter();
-  $('#control-presta-filter-trigger')?.focus();
+  if (event.key !== 'Escape') return;
+  if (!$('#control-presta-filter-menu')?.hidden) {
+    closeControlPrestaFilter();
+    $('#control-presta-filter-trigger')?.focus();
+  }
+  if (!$('#control-check-sort-menu')?.hidden) {
+    closeControlCheckSortMenu();
+    $('#control-check-sort-trigger')?.focus();
+  }
 });
 
-window.addEventListener('resize', closeControlPrestaFilter);
-window.addEventListener('scroll', closeControlPrestaFilter, true);
+window.addEventListener('resize', () => {
+  closeControlPrestaFilter();
+  closeControlCheckSortMenu();
+});
+window.addEventListener('scroll', () => {
+  closeControlPrestaFilter();
+  closeControlCheckSortMenu();
+}, true);
 
 $('.control-center-card').addEventListener('click', (event) => {
   if (!event.target.closest('#configure-control-mappings')) return;

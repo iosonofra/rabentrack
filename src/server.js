@@ -554,6 +554,7 @@ app.get('/api/control-center', async (req, res) => {
       checkedAfter: req.query.checkedAfter,
       exceptionOnly: req.query.exceptions === '1',
       archived: req.query.archived === '1' || req.query.archived === 'true',
+      checkSort: req.query.checkSort,
       page: req.query.page,
       pageSize: req.query.pageSize,
     });

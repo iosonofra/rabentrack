@@ -245,7 +245,14 @@ Il risultato atteso per Camofox deve mostrare `127.0.0.1:9377`, non `0.0.0.0:937
 
 ## Aggiornamento dell'applicazione
 
-Per un aggiornamento controllato su Debian:
+### Metodo 1 — Da repository Git
+
+```bash
+cd /opt/raben-tracking-center
+bash scripts/update.sh
+```
+
+oppure passo-passo:
 
 ```bash
 cd /opt/raben-tracking-center
@@ -256,6 +263,27 @@ CAMOUFOX_INSTALL_DIR=/opt/raben-tracking-center/.cache/camoufox npx camoufox-js 
 chown -R raben:raben /opt/raben-tracking-center
 systemctl daemon-reload
 systemctl start camofox raben-tracking-center
+```
+
+### Metodo 2 — Da archivio ZIP (aggiornamento pulito senza Git)
+
+Lo zip di aggiornamento include tutto il codice aggiornato, frontend e script, escludendo cartelle dati (`data/`), credenziali (`.env`) e `node_modules` (che verranno compilate per Linux).
+
+1. Copiare l'archivio ZIP sul server o nel container LXC (es. tramite Proxmox host: `pct push <ID_CT> raben-tracking-center-update.zip /tmp/raben-update.zip` o via SCP/SFTP in `/tmp`).
+2. Eseguire nel container:
+
+```bash
+cd /opt/raben-tracking-center
+
+# 1. Arresto prudenziale dei servizi
+systemctl stop camofox raben-tracking-center
+
+# 2. Estrazione dello zip sopra l'installazione (i dati esistenti e il .env sono al sicuro)
+unzip -o /tmp/raben-update.zip -d /opt/raben-tracking-center
+
+# 3. Permessi di esecuzione e completamento aggiornamento
+chmod +x scripts/*.sh
+bash scripts/update.sh
 ```
 
 Verificare poi entrambi i servizi e l'endpoint `/health` di Camofox.

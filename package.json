@@ -7,7 +7,8 @@
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "camofox": "node src/start-camofox.js",
-    "test": "node --test --test-concurrency=1 tests/*.test.js"
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
+    "package:zip": "node scripts/create-clean-zip.js"
   },
   "dependencies": {
     "@askjo/camofox-browser": "^1.14.0",
