@@ -106,6 +106,44 @@ function displayRabenEventDate(row) {
   return escapeHtml(row?.rabenStatusDatePrecision === 'raw' ? 'Data evento non riconosciuta' : 'Data evento non disponibile');
 }
 function selectedRows() { return previewRows.filter((row) => row.canApply && row.selected); }
+function currentImportOptions() {
+  const updateTracking = $('#update-tracking')?.checked === true;
+  const updateState = $('#update-state')?.checked === true;
+  return {
+    updateTracking,
+    updateState,
+    overwriteTracking: updateTracking && $('#overwrite-tracking')?.checked === true,
+  };
+}
+function importRowHasTrackingConflict(row) {
+  const existingTracking = String(row?.existingTracking || '').trim();
+  const requestedTracking = String(row?.trackingNumber || '').trim();
+  return Boolean(existingTracking && requestedTracking && existingTracking !== requestedTracking);
+}
+function importRowIsEligible(row, options = currentImportOptions()) {
+  if (!row || row.alreadyImported || row.duplicateReference) return false;
+  if (!['Pronta per aggiornamento', 'Tracking già presente'].includes(row.verification)) return false;
+  if (!options.updateTracking && !options.updateState) return false;
+  if (importRowHasTrackingConflict(row) && !options.updateState && !(options.updateTracking && options.overwriteTracking)) return false;
+  return true;
+}
+function refreshImportEligibility({ selectEligible = false, render = true } = {}) {
+  const options = currentImportOptions();
+  previewRows.forEach((row) => {
+    const eligible = importRowIsEligible(row, options);
+    row.canApply = eligible;
+    if (!eligible) row.selected = false;
+    else if (selectEligible && !importApplied) row.selected = true;
+  });
+  if (verificationId && $('#summary')) {
+    const ready = previewRows.filter((row) => row.canApply).length;
+    const skipped = previewRows.filter((row) => !row.canApply && (row.alreadyImported || row.verification === 'Tracking già presente' || row.verification?.includes('saltata'))).length;
+    const invalid = previewRows.filter((row) => !row.canApply && !row.alreadyImported && row.verification !== 'Tracking già presente' && !row.verification?.includes('saltata')).length;
+    $('#summary').textContent = `${ready} pronte con le opzioni correnti · ${skipped} saltate · ${invalid} da controllare`;
+  }
+  if (render) renderRows(previewRows, 'verification');
+  updateSelectionUi();
+}
 function stateBadge(value) {
   const label = escapeHtml(value || '—');
   const normalized = String(value || '').toLocaleLowerCase('it-IT');
@@ -232,10 +270,10 @@ let currentVerificationJobId = null;
 function getFilteredPreviewRows(sourceList = previewRows) {
   if (!sourceList || !sourceList.length) return [];
   if (currentPreviewTab === 'ready') {
-    return sourceList.filter((r) => r.canApply || r.verification === 'Pronta per aggiornamento' || r.verification === 'In verifica…');
+    return sourceList.filter((r) => r.canApply || r.verification === 'In verifica…');
   }
   if (currentPreviewTab === 'skipped') {
-    return sourceList.filter((r) => r.alreadyImported || (r.verification && (r.verification.includes('già presente') || r.verification.includes('saltata') || r.verification.includes('Già importata'))));
+    return sourceList.filter((r) => !r.canApply && (r.alreadyImported || (r.verification && (r.verification.includes('già presente') || r.verification.includes('saltata') || r.verification.includes('Già importata')))));
   }
   if (currentPreviewTab === 'invalid') {
     return sourceList.filter((r) => !r.canApply && !r.alreadyImported && r.verification !== 'In verifica…' && (!r.verification || (!r.verification.includes('già presente') && !r.verification.includes('saltata') && !r.verification.includes('Già importata'))));
@@ -244,8 +282,8 @@ function getFilteredPreviewRows(sourceList = previewRows) {
 }
 
 function updatePreviewTabCounts() {
-  const ready = previewRows.filter((r) => r.canApply || r.verification === 'Pronta per aggiornamento' || r.verification === 'In verifica…').length;
-  const skipped = previewRows.filter((r) => r.alreadyImported || (r.verification && (r.verification.includes('già presente') || r.verification.includes('saltata') || r.verification.includes('Già importata')))).length;
+  const ready = previewRows.filter((r) => r.canApply || r.verification === 'In verifica…').length;
+  const skipped = previewRows.filter((r) => !r.canApply && (r.alreadyImported || (r.verification && (r.verification.includes('già presente') || r.verification.includes('saltata') || r.verification.includes('Già importata'))))).length;
   const invalid = previewRows.filter((r) => !r.canApply && !r.alreadyImported && r.verification !== 'In verifica…' && (!r.verification || (!r.verification.includes('già presente') && !r.verification.includes('saltata') && !r.verification.includes('Già importata')))).length;
   const total = previewRows.length;
 
@@ -309,17 +347,6 @@ function updateSelectionUi() {
   }
 }
 
-function showApplyFeedback(summary) {
-  const updated = Number(summary.Aggiornata || 0);
-  const failed = Number(summary.Errore || 0);
-  const skipped = Number(summary.Saltata || 0);
-  const card = $('#apply-feedback');
-  if (card) {
-    card.hidden = false;
-    card.innerHTML = `<div class="apply-feedback-heading"><div><h3>${failed ? 'Aggiornamento completato con avvisi' : 'Aggiornamento completato'}</h3><p>Gli esiti sono riportati anche riga per riga nella colonna “Esito”.</p></div><span class="apply-check">${failed ? '!' : '✓'}</span></div><div class="apply-metrics"><div class="apply-metric success"><strong>${updated}</strong><span>Aggiornate</span></div><div class="apply-metric error"><strong>${failed}</strong><span>Con errori</span></div><div class="apply-metric skipped"><strong>${skipped}</strong><span>Saltate</span></div></div>`;
-  }
-}
-
 function updateProgress(progress) {
   const percentage = progress.total ? Math.round((progress.completed / progress.total) * 100) : 100;
   if ($('#verify-progress')) $('#verify-progress').hidden = false;
@@ -344,8 +371,12 @@ function updateApplyProgress(progress) {
 
 async function waitForApply(jobId) {
   const snapshot = await request(`/api/import/apply-jobs/${jobId}`);
-  updateApplyProgress(snapshot.progress);
-  if (snapshot.status === 'running') { await new Promise((resolve) => setTimeout(resolve, 650)); return waitForApply(jobId); }
+  if (snapshot.status === 'running') {
+    updateApplyProgress(snapshot.progress);
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    return waitForApply(jobId);
+  }
+  if ($('#apply-progress')) $('#apply-progress').hidden = true;
   if (snapshot.status === 'failed') throw new Error(snapshot.error || 'L’aggiornamento non è riuscito.');
   return snapshot.result;
 }
@@ -353,9 +384,10 @@ async function waitForApply(jobId) {
 async function waitForVerification(jobId) {
   const snapshot = await request(`/api/import/verification-jobs/${jobId}`);
   if (snapshot.status === 'cancelled') {
+    if ($('#verify-progress')) $('#verify-progress').hidden = true;
     return { cancelled: true };
   }
-  updateProgress(snapshot.progress);
+  if (snapshot.status === 'running') updateProgress(snapshot.progress);
 
   // Live row updating
   if (snapshot.progress?.outcomes) {
@@ -370,14 +402,15 @@ async function waitForVerification(jobId) {
         r.orderDate = outcome.orderDate ?? r.orderDate;
         r.prestaStateId = outcome.prestaStateId ?? r.prestaStateId;
         r.currentState = outcome.currentState ?? r.currentState;
-        r.canApply = ['Pronta per aggiornamento', 'Tracking già presente'].includes(outcome.status) && !r.duplicateReference;
+        r.canApply = false;
         changed = true;
       }
     });
-    if (changed) renderRows();
+    if (changed) refreshImportEligibility();
   }
 
   if (snapshot.status === 'running') { await new Promise((resolve) => setTimeout(resolve, 700)); return waitForVerification(jobId); }
+  if ($('#verify-progress')) $('#verify-progress').hidden = true;
   if (snapshot.status === 'failed') throw new Error(snapshot.error || 'La verifica non è riuscita.');
   return snapshot.result;
 }
@@ -427,7 +460,7 @@ function controlBadge(status) {
 function rabenBadge(status) {
   const label = status || 'Non verificato';
   const normalized = label.toLocaleLowerCase('it-IT');
-  const kind = normalized.includes('errore') || normalized.includes('verificare manualmente') ? 'incomplete' : normalized.includes('intervento') || normalized.includes('eccezione') ? 'attention' : normalized.includes('non trovato') ? 'warning' : normalized === 'non verificato' ? 'pending' : normalized.includes('consegnat') ? 'delivered' : /in transito|in consegna|centro di distribuzione/.test(normalized) ? 'transit' : normalized.includes('prenotat') ? 'booked' : 'unmapped';
+  const kind = normalized.includes('errore') || normalized.includes('verificare manualmente') ? 'incomplete' : normalized.includes('intervento') || normalized.includes('eccezione') ? 'attention' : normalized.includes('non trovato') ? 'warning' : normalized === 'non verificato' ? 'pending' : /in transito|in consegna|centro di distribuzione/.test(normalized) ? 'transit' : normalized.includes('consegnat') ? 'delivered' : normalized.includes('prenotat') ? 'booked' : 'unmapped';
   return `<span class="raben-result ${kind}">${escapeHtml(label)}</span>`;
 }
 
@@ -539,8 +572,8 @@ const Raben_STATUS_ORDER = ['Registrata', 'Caricata', 'Prenotata', 'In transito'
 
 function rabenFilterKind(status) {
   const normalized = status.toLocaleLowerCase('it-IT');
-  if (normalized.includes('consegnat')) return 'delivered';
   if (/in transito|in consegna|centro di distribuzione/.test(normalized)) return 'transit';
+  if (normalized.includes('consegnat')) return 'delivered';
   if (normalized.includes('prenotat')) return 'booked';
   if (/intervento|eccezione|non trovata/.test(normalized)) return 'attention';
   if (/errore|verificare manualmente/.test(normalized)) return 'incomplete';
@@ -4945,6 +4978,10 @@ $('#import-state')?.addEventListener('change', () => syncState($('#import-state'
 
 $('#load-catalog')?.addEventListener('click', () => loadCatalogOptions(false));
 
+if (!$('#overwrite-tracking')) {
+  $('#update-state')?.closest('.toggle-option')?.insertAdjacentHTML('afterend', '<label class="toggle-option overwrite-option"><input id="overwrite-tracking" type="checkbox"> Sovrascrivi tracking diverso già presente</label>');
+}
+
 $('#tab-import-excel')?.addEventListener('click', () => {
   $('#tab-import-excel').classList.add('active');
   $('#tab-import-excel').setAttribute('aria-selected', 'true');
@@ -5016,7 +5053,6 @@ $('#manual-import-form')?.addEventListener('submit', async (event) => {
     $('#clear-selection').hidden = true;
     $('#toggle-all').hidden = true;
     $('#selected-count').hidden = true;
-    $('#update-options').hidden = true;
     $('#raben-beta').hidden = true;
     $('#verify-raben-beta').hidden = true;
 
@@ -5040,6 +5076,7 @@ $('#manual-clear-btn')?.addEventListener('click', () => {
   previewRows = [];
   verificationId = '';
   importApplied = false;
+  if ($('#overwrite-tracking')) $('#overwrite-tracking').checked = false;
   $('#summary').hidden = true;
   $('#preview').hidden = true;
   if ($('#import-preview-tabs')) $('#import-preview-tabs').hidden = true;
@@ -5051,7 +5088,6 @@ $('#manual-clear-btn')?.addEventListener('click', () => {
   $('#clear-selection').hidden = true;
   $('#toggle-all').hidden = true;
   $('#selected-count').hidden = true;
-  $('#update-options').hidden = true;
   $('#raben-beta').hidden = true;
   $('#verify-raben-beta').hidden = true;
   tell('#import-message', 'Lista di anteprima svuotata.', 'success');
@@ -5081,6 +5117,7 @@ async function startUnifiedImport(fileObj) {
   currentVerificationJobId = null;
   lastImportResults = null;
   currentPreviewTab = 'ready';
+  if ($('#overwrite-tracking')) $('#overwrite-tracking').checked = false;
 
   if ($('#import-success-card')) $('#import-success-card').hidden = true;
   if ($('#apply-feedback')) $('#apply-feedback').hidden = true;
@@ -5155,11 +5192,12 @@ async function startUnifiedImport(fileObj) {
 
     previewRows = verifiedRows.map((row) => ({
       ...row,
-      selected: row.verification === 'Pronta per aggiornamento',
+      selected: false,
     }));
+    refreshImportEligibility({ selectEligible: true, render: false });
 
-    const readyCount = previewRows.filter((row) => row.verification === 'Pronta per aggiornamento').length;
-    const skippedCount = previewRows.filter((row) => row.verification === 'Tracking già presente' || row.alreadyImported || row.verification?.includes('saltata')).length;
+    const readyCount = previewRows.filter((row) => row.canApply).length;
+    const skippedCount = previewRows.filter((row) => !row.canApply && (row.verification === 'Tracking già presente' || row.alreadyImported || row.verification?.includes('saltata'))).length;
 
     if ($('#summary')) {
       $('#summary').textContent = `${readyCount} pronte per aggiornamento · ${skippedCount} saltate (già presenti/importate) · ${previewRows.length - readyCount - skippedCount} da controllare`;
@@ -5171,7 +5209,7 @@ async function startUnifiedImport(fileObj) {
 
     tell(
       '#import-message',
-      `${readyCount} ordini pronti per l'aggiornamento (${skippedCount} già presenti e saltati). Seleziona il corriere e conferma.`,
+      `${readyCount} ordini pronti con le opzioni correnti${skippedCount ? `; ${skippedCount} saltati` : ''}. Controlla corriere, stato e conferma.`,
       skippedCount ? 'warning' : 'success'
     );
   } catch (e) {
@@ -5197,6 +5235,7 @@ function resetImportWorkspace() {
   verificationId = '';
   importApplied = false;
   lastImportResults = null;
+  if ($('#overwrite-tracking')) $('#overwrite-tracking').checked = false;
 
   if ($('#summary')) $('#summary').hidden = true;
   if ($('#import-preview-tabs')) $('#import-preview-tabs').hidden = true;
@@ -5323,11 +5362,12 @@ $('#verify-import')?.addEventListener('click', async () => {
     if ($('#verify-progress')) $('#verify-progress').hidden = true;
     if ($('#cancel-verify-btn')) $('#cancel-verify-btn').hidden = true;
 
-    previewRows = rows.map((row) => ({ ...row, selected: row.verification === 'Pronta per aggiornamento' }));
+    previewRows = rows.map((row) => ({ ...row, selected: false }));
+    refreshImportEligibility({ selectEligible: true, render: false });
     renderRows(previewRows, 'verification');
     updateSelectionUi();
     void refreshControlCenter();
-    tell('#import-message', `Verifica completata: ${previewRows.filter((r) => r.canApply).length} pronte per aggiornamento.`, 'success');
+    tell('#import-message', `Verifica completata: ${previewRows.filter((r) => r.canApply).length} pronte con le opzioni correnti.`, 'success');
   } catch (e) {
     tell('#import-message', e.message, 'error');
   } finally {
@@ -5360,10 +5400,27 @@ $('#toggle-all')?.addEventListener('change', (event) => {
   updateSelectionUi();
 });
 
+function syncOverwriteTrackingOption() {
+  const updateTracking = $('#update-tracking')?.checked === true;
+  const overwrite = $('#overwrite-tracking');
+  if (!overwrite) return;
+  overwrite.disabled = !updateTracking;
+  if (!updateTracking) overwrite.checked = false;
+}
+
+$('#update-tracking')?.addEventListener('change', () => {
+  syncOverwriteTrackingOption();
+  refreshImportEligibility();
+});
+$('#update-state')?.addEventListener('change', () => refreshImportEligibility());
+$('#overwrite-tracking')?.addEventListener('change', () => refreshImportEligibility());
+syncOverwriteTrackingOption();
+
 function showImportSuccessCard(summary, results) {
   const card = $('#import-success-card');
   const grid = $('#success-kpi-grid');
   const subtitle = $('#success-card-subtitle');
+  const title = card?.querySelector('.success-card-header h3');
   if (!card || !grid) return;
 
   const updated = Number(summary.Aggiornata || 0);
@@ -5371,11 +5428,11 @@ function showImportSuccessCard(summary, results) {
   const skipped = Number(summary.Saltata || 0);
   const total = results?.length || (updated + errors + skipped);
 
-  if (subtitle) {
-    subtitle.textContent = errors > 0
-      ? `${updated} ordini aggiornati con successo, ${errors} con errori o avvisi.`
-      : `Tutti i ${updated} ordini selezionati sono stati aggiornati su PrestaShop.`;
-  }
+  card.classList.toggle('has-errors', errors > 0);
+  if (title) title.textContent = errors > 0 ? 'Aggiornamento completato con errori' : 'Aggiornamento PrestaShop completato';
+  if (subtitle) subtitle.textContent = errors > 0
+    ? `${updated} aggiornati, ${errors} con errori e ${skipped} saltati.`
+    : `${updated} aggiornati${skipped ? ` e ${skipped} saltati senza modifiche` : ''}.`;
 
   grid.innerHTML = `
     <div class="kpi-box success">
@@ -5408,6 +5465,7 @@ $('#apply-import')?.addEventListener('click', async () => {
   const stateId = $('#import-state')?.value || $('#state')?.value;
   const updateTracking = $('#update-tracking')?.checked ?? true;
   const updateState = $('#update-state')?.checked ?? true;
+  const overwriteTracking = updateTracking && $('#overwrite-tracking')?.checked === true;
 
   if (!updateTracking && !updateState) {
     tell('#import-message', 'Scegli almeno un tipo di aggiornamento (tracking o stato).', 'error');
@@ -5424,7 +5482,11 @@ $('#apply-import')?.addEventListener('click', async () => {
     return;
   }
 
-  if (!confirm(`Confermi l’aggiornamento di ${selected.length} righe selezionate su PrestaShop? Le righe escluse non saranno modificate.`)) return;
+  const overwriteCount = overwriteTracking ? selected.filter(importRowHasTrackingConflict).length : 0;
+  const confirmation = overwriteCount > 0
+    ? `Confermi l’aggiornamento di ${selected.length} righe? Il tracking verrà sostituito su ${overwriteCount} ordin${overwriteCount === 1 ? 'e' : 'i'}. Questa scelta è esplicita e riguarda solo le righe selezionate.`
+    : `Confermi l’aggiornamento di ${selected.length} righe selezionate su PrestaShop? Le righe escluse non saranno modificate.`;
+  if (!confirm(confirmation)) return;
 
   try {
     $('#apply-import').disabled = true;
@@ -5440,6 +5502,7 @@ $('#apply-import')?.addEventListener('click', async () => {
         stateId,
         updateTracking,
         updateState,
+        overwriteTracking,
         selectedSourceRows: selected.map((row) => row.sourceRow),
       }),
     });
@@ -5464,12 +5527,13 @@ $('#apply-import')?.addEventListener('click', async () => {
 
     renderRows(previewRows, 'verification');
     updateSelectionUi();
-    showApplyFeedback(summary);
+    if ($('#apply-feedback')) $('#apply-feedback').hidden = true;
     showImportSuccessCard(summary, results);
     void refreshControlCenter();
 
-    tell('#import-message', Object.entries(summary).map(([name, count]) => `${name}: ${count}`).join(' · '), Number(summary.Errore || 0) ? 'warning' : 'success');
+    tell('#import-message', '', '');
   } catch (e) {
+    if ($('#apply-progress')) $('#apply-progress').hidden = true;
     tell('#import-message', e.message, 'error');
   } finally {
     $('#apply-import').disabled = false;

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import express from 'express';
 import multer from 'multer';
 import { readRabenWorkbook } from './excel-import.js';
+import { isImportRowEligible, normalizeImportOptions } from './import-eligibility.js';
 import { PrestaShopClient } from './prestashop-client.js';
 import { exportSettingsData, loadSettings, normalizeCronSettings, normalizeRabenStateMappings, normalizeNotificationSettings, restoreSettingsData, saveSettings } from './settings-store.js';
 import { DEFAULT_Raben_TRACKING_URL, Raben_PARSER_VERSION, Raben_SPEED_PROFILES, RabenBetaClient, normalizeBetaSettings } from './raben-beta-client.js';
@@ -1089,23 +1090,25 @@ app.get('/api/import/verification-jobs/:jobId', (req, res) => {
 
 app.post('/api/import/apply', async (req, res) => {
   try {
-    const { verificationId, carrierId, stateId, selectedSourceRows, updateTracking, updateState } = req.body ?? {};
+    const { verificationId, carrierId, stateId, selectedSourceRows } = req.body ?? {};
+    const { updateTracking, updateState, overwriteTracking } = normalizeImportOptions(req.body ?? {});
     const verified = verifiedImports.get(verificationId);
     if (!verified || verified.expiresAt < Date.now()) throw new Error('La verifica è scaduta. Eseguila nuovamente prima di importare.');
     const selectedRows = new Set((selectedSourceRows ?? []).map(Number));
-    const rows = verified.rows.filter((row) => row.canApply && selectedRows.has(Number(row.sourceRow)));
-    if (!rows.length) throw new Error('Seleziona almeno una riga pronta per aggiornamento.');
     if (!updateTracking && !updateState) throw new Error('Scegli almeno un aggiornamento: tracking/corriere o stato ordine.');
     if (updateTracking && !carrierId) throw new Error('Seleziona un corriere per aggiornare tracking e corriere.');
     if (updateState && !stateId) throw new Error('Seleziona uno stato ordine da applicare.');
+    const rows = verified.rows.filter((row) => selectedRows.has(Number(row.sourceRow)) && isImportRowEligible(row, { updateTracking, updateState, overwriteTracking }));
+    if (!rows.length) throw new Error('Nessuna riga selezionata è applicabile con le opzioni correnti. Riesegui la verifica o modifica le opzioni.');
     const shop = client();
     const results = [];
     for (const row of rows) {
-      if (!row.canApply) { results.push({ ...row, result: 'Saltata', detail: row.verification || row.validation || 'Non verificata' }); continue; }
       try {
-        const outcome = await shop.applyOrderUpdate({ orderId: row.orderId, trackingNumber: row.trackingNumber, carrierId, stateId, updateTracking, updateState });
+        const outcome = await shop.applyOrderUpdate({ orderId: row.orderId, trackingNumber: row.trackingNumber, carrierId, stateId, updateTracking, updateState, overwriteTracking, expectedExistingTracking: row.existingTracking });
         const detail = outcome.trackingSkipped
           ? `Ordine ${row.orderId}: tracking già presente, aggiornato solo lo stato`
+          : outcome.carrierUpdateOutcome?.overwritten
+            ? `Ordine ${row.orderId}: tracking PrestaShop sostituito con consenso esplicito`
           : outcome.recoveredAfterError
             ? `Ordine ${row.orderId}: tracking e corriere confermati tramite rilettura dopo una risposta anomala di PrestaShop`
             : `Ordine ${row.orderId}`;
@@ -1221,16 +1224,17 @@ function scheduleRabenBetaJob(job, trackingNumbers) {
 }
 
 function prepareApply(payload) {
-  const { verificationId, carrierId, stateId, selectedSourceRows, updateTracking, updateState } = payload;
+  const { verificationId, carrierId, stateId, selectedSourceRows } = payload;
+  const { updateTracking, updateState, overwriteTracking } = normalizeImportOptions(payload);
   const verified = verifiedImports.get(verificationId);
   if (!verified || verified.expiresAt < Date.now()) throw new Error('La verifica è scaduta. Eseguila nuovamente prima di importare.');
   const selectedRows = new Set((selectedSourceRows ?? []).map(Number));
-  const rows = verified.rows.filter((row) => row.canApply && selectedRows.has(Number(row.sourceRow)));
-  if (!rows.length) throw new Error('Seleziona almeno una riga pronta per aggiornamento.');
   if (!updateTracking && !updateState) throw new Error('Scegli almeno un aggiornamento: tracking/corriere o stato ordine.');
   if (updateTracking && !carrierId) throw new Error('Seleziona un corriere per aggiornare tracking e corriere.');
   if (updateState && !stateId) throw new Error('Seleziona uno stato ordine da applicare.');
-  return { verified, verificationId, carrierId, stateId, updateTracking: Boolean(updateTracking), updateState: Boolean(updateState), rows };
+  const rows = verified.rows.filter((row) => selectedRows.has(Number(row.sourceRow)) && isImportRowEligible(row, { updateTracking, updateState, overwriteTracking }));
+  if (!rows.length) throw new Error('Nessuna riga selezionata è applicabile con le opzioni correnti. Riesegui la verifica o modifica le opzioni.');
+  return { verified, verificationId, carrierId, stateId, updateTracking, updateState, overwriteTracking, rows };
 }
 
 async function runApplyJob(job, prepared) {
@@ -1239,9 +1243,11 @@ async function runApplyJob(job, prepared) {
     const results = [];
     for (const [index, row] of prepared.rows.entries()) {
       try {
-        const outcome = await shop.applyOrderUpdate({ orderId: row.orderId, trackingNumber: row.trackingNumber, carrierId: prepared.carrierId, stateId: prepared.stateId, updateTracking: prepared.updateTracking, updateState: prepared.updateState });
+        const outcome = await shop.applyOrderUpdate({ orderId: row.orderId, trackingNumber: row.trackingNumber, carrierId: prepared.carrierId, stateId: prepared.stateId, updateTracking: prepared.updateTracking, updateState: prepared.updateState, overwriteTracking: prepared.overwriteTracking, expectedExistingTracking: row.existingTracking });
         const detail = outcome.trackingSkipped
           ? `Ordine ${row.orderId}: tracking già presente, aggiornato solo lo stato`
+          : outcome.carrierUpdateOutcome?.overwritten
+            ? `Ordine ${row.orderId}: tracking PrestaShop sostituito con consenso esplicito`
           : outcome.recoveredAfterError
             ? `Ordine ${row.orderId}: tracking e corriere confermati tramite rilettura dopo una risposta anomala di PrestaShop`
             : `Ordine ${row.orderId}`;

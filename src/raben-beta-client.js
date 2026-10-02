@@ -11,7 +11,7 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const TRACKING_POLL_TIMEOUT_MS = 18_000;
 const TRACKING_POLL_INTERVAL_MS = 700;
 const FAST_TRACKING_POLL_INTERVALS_MS = [250, 500, 800, 1200];
-export const Raben_PARSER_VERSION = 6;
+export const Raben_PARSER_VERSION = 8;
 export const DEFAULT_Raben_TRACKING_URL = 'https://oftc.myraben.com/link/ShipmentInformation?ShipmentNumber=TRACKINGDAINSERIRE&Language=IT';
 
 export const Raben_SPEED_PROFILES = Object.freeze({
@@ -60,10 +60,13 @@ function findRef(snapshot, expression) {
 
 const Raben_STATUS_RULES = [
   { status: 'Consegnata con riserva', expression: /\b(?:consegnat[ao] con (?:osservazioni|riserva)|delivered with remarks?)\b/i },
+  { status: 'Prenotata', expression: /\b(?:consegnat[ao] al terminal(?: dal mittente)?|terminal dal mittente|delivered to (?:the )?(?:sender )?terminal)\b/i },
   { status: 'Eccezione Raben', expression: /\b(?:non consegnat[ao]|non ritirat[ao]|parere richiesto|parametri errati|delivery failed|exception)\b/i },
   { status: 'Consegnata', expression: /\b(?:consegnat[ao]|delivered)\b/i },
   { status: 'In consegna', expression: /\b(?:in consegna|out for delivery)\b/i },
+  { status: 'In transito', expression: /\b(?:partit[ao]|departed)\b/i },
   { status: 'In transito', expression: /\b(?:in transito|in transit|scaricat[ao]|inventario a magazzino|nuova data di consegna|in corso)\b/i },
+  { status: 'Prenotata', expression: /\b(?:prenotat[ao]|booked)\b/i },
   { status: 'Caricata', expression: /\b(?:caricat[ao]|loaded)\b/i },
   { status: 'Registrata', expression: /\b(?:registrat[ao] a sistema|registered)\b/i },
 ];
@@ -155,11 +158,12 @@ export function parseRabenEventDate(value) {
 function timelineRowStatus(row) {
   const value = `${row.event} ${row.reason}`;
   if (/\bnon consegnat|non caricat|rifiutat|eccezion|exception|failed delivery/i.test(value)) return 'Eccezione Raben';
-  if (/terminal dal mittente|sender terminal/i.test(value)) return 'Prenotata';
+  if (/consegnat[ao] al terminal|terminal dal mittente|sender terminal|delivered to (?:the )?(?:sender )?terminal/i.test(value)) return 'Prenotata';
+  if (/\b(?:partit[ao]|departed)\b/i.test(value)) return 'In transito';
   const canonical = canonicalRabenStatus(row.event);
   if (canonical) return canonical;
   if (/fuori per la consegna|out for delivery/i.test(value)) return 'In consegna';
-  if (/\b(?:partit|arrivat|departed|arrived)\b/i.test(value)) return 'In transito';
+  if (/\b(?:arrivat|arrived)\b/i.test(value)) return 'In transito';
   return null;
 }
 
@@ -195,10 +199,15 @@ function newestTimelineRows(timeline) {
 
 export function parseRabenDomEvidence(evidence = {}) {
   const summaryStatus = canonicalRabenStatus(evidence.summary?.status);
-  if (summaryStatus) return statusResult(summaryStatus, 'Stato corrente letto dal riepilogo della spedizione Raben.', { evidence: 'dom-summary', confidence: .995, reasonCode: 'STATUS_CONFIRMED', rawStatus: evidence.summary.status });
+  const timelineStatus = statusFromTimeline(evidence.timeline);
+  if (summaryStatus) {
+    return statusResult(summaryStatus, 'Stato corrente letto dal riepilogo della spedizione Raben.', { evidence: 'dom-summary', confidence: .995, reasonCode: 'STATUS_CONFIRMED', rawStatus: evidence.summary.status });
+  }
   for (const summary of evidence.summaryTexts || []) {
     const status = canonicalRabenStatus(summary);
-    if (status) return statusResult(status, 'Stato corrente letto dal riepilogo della spedizione Raben.', { evidence: 'dom-summary', confidence: .99, reasonCode: 'STATUS_CONFIRMED', rawStatus: summary });
+    if (status) {
+      return statusResult(status, 'Stato corrente letto dal riepilogo della spedizione Raben.', { evidence: 'dom-summary', confidence: .99, reasonCode: 'STATUS_CONFIRMED', rawStatus: summary });
+    }
   }
   for (const heading of evidence.headings || []) {
     const result = parseRabenStatusSnapshot(heading);
@@ -208,7 +217,7 @@ export function parseRabenDomEvidence(evidence = {}) {
     const statuses = Raben_STATUS_RULES.filter((rule) => rule.expression.test(String(activeText))).map((rule) => rule.status);
     if (statuses.length === 1) return statusResult(statuses[0], 'Stato letto dall’elemento attivo della pagina Raben.', { evidence: 'dom-active-step', confidence: .97, reasonCode: 'STATUS_CONFIRMED', rawStatus: activeText });
   }
-  return statusFromTimeline(evidence.timeline);
+  return timelineStatus;
 }
 
 export class RabenBetaClient {

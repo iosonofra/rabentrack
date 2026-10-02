@@ -16,6 +16,15 @@ async function load() {
   database.batches ||= [];
   let migrated = false;
   for (const record of Object.values(database.shipments)) {
+    const normalizedStatus = normalizeStoredRabenStatus(record.rabenStatus);
+    if (record.rabenStatus !== normalizedStatus) {
+      record.rabenStatus = normalizedStatus;
+      migrated = true;
+    }
+    if ('rabenPhaseStatus' in record) {
+      delete record.rabenPhaseStatus;
+      migrated = true;
+    }
     if (!Array.isArray(record.rabenTimeline)) continue;
     const normalizedTimeline = normalizeRabenTimeline(record.rabenTimeline);
     if (JSON.stringify(normalizedTimeline) !== JSON.stringify(record.rabenTimeline)) {
@@ -47,6 +56,8 @@ export function normalizeStoredRabenStatus(value) {
   if (/^consegnata con riserva$|^consegnato con osservazioni$/.test(normalized)) return 'Consegnata con riserva';
   if (/^consegnat[oa]$|^delivered$/.test(normalized)) return 'Consegnata';
   if (/^in consegna$|^out for delivery$/.test(normalized)) return 'In consegna';
+  if (/^consegnat[oa] al terminal$|terminal dal mittente/.test(normalized)) return 'Prenotata';
+  if (/^partit[oa]$|^departed$/.test(normalized)) return 'In transito';
   if (/centro di distribuzione|distribution cent(?:er|re)/.test(normalized)) return 'Centro di distribuzione';
   if (/^in transito$|^in transit$/.test(normalized)) return 'In transito';
   if (/^caricat[oa]$|^loaded$/.test(normalized)) return 'Caricata';
@@ -162,6 +173,7 @@ export async function syncRabenShipments(results) {
     record.rabenStatus = nextRabenStatus;
     record.rabenDetail = result.detail || '';
     record.rabenRawStatus = result.rawStatus || '';
+    delete record.rabenPhaseStatus;
     record.rabenEvidence = result.evidence || '';
     record.rabenConfidence = Number(result.confidence) || 0;
     record.rabenReasonCode = result.reasonCode || '';

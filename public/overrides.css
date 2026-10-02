@@ -5032,6 +5032,7 @@ main > .workspace-view {
 }
 .unified-toggles {
   display: flex;
+  flex-wrap: wrap;
   gap: 14px;
   align-items: center;
   padding-bottom: 6px;
@@ -5046,6 +5047,14 @@ main > .workspace-view {
   color: var(--ink);
   cursor: pointer;
   user-select: none;
+}
+.toggle-option.overwrite-option {
+  color: #8f1d24;
+}
+.toggle-option.overwrite-option:has(input:disabled) {
+  color: #7b8798;
+  cursor: not-allowed;
+  opacity: .72;
 }
 .import-action-buttons {
   display: flex;
@@ -5135,6 +5144,15 @@ main > .workspace-view {
   border-radius: 4px;
   box-shadow: 0 6px 18px rgba(0, 125, 73, 0.08);
   margin-bottom: 20px;
+}
+.import-success-card.has-errors {
+  border-color: #efb8bc;
+  border-top-color: var(--danger);
+  box-shadow: 0 6px 18px rgba(176, 23, 35, 0.08);
+}
+.import-success-card.has-errors .success-icon {
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 .success-card-header {
   display: flex;
