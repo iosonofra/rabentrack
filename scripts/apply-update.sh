@@ -41,4 +41,8 @@ cd "${APP_DIR}"
 chmod +x "${APP_DIR}/scripts/"*.sh 2>/dev/null || true
 
 echo -e "${YELLOW}==> Esecuzione script di aggiornamento dipendenze e servizi...${NC}"
-bash "${APP_DIR}/scripts/update.sh"
+if [ -n "${ZIP_FILE}" ]; then
+    RABEN_SKIP_GIT_UPDATE=1 bash "${APP_DIR}/scripts/update.sh"
+else
+    bash "${APP_DIR}/scripts/update.sh"
+fi
