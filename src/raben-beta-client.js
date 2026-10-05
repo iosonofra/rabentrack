@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
+
+export { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
 
 const Raben_HOSTS = new Set([
   'oftc.myraben.com',
@@ -20,10 +23,6 @@ export const Raben_SPEED_PROFILES = Object.freeze({
   fast: Object.freeze({ id: 'fast', reuseTab: true, initialDelayMs: 150, manualDelayMs: [1200, 2000], cronDelayMs: [1800, 3000] }),
   ultra: Object.freeze({ id: 'ultra', reuseTab: true, initialDelayMs: 50, manualDelayMs: [350, 700], cronDelayMs: [700, 1200] }),
 });
-
-export function normalizeRabenSpeedProfile(value) {
-  return ['safe', 'fast', 'ultra'].includes(value) ? value : 'safe';
-}
 
 function assertLoopback(value) {
   const url = new URL(value);

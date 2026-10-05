@@ -1,13 +1,12 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
+
+export { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const settingsPath = join(projectRoot, 'data', 'settings.json');
-
-export function normalizeRabenSpeedProfile(value) {
-  return ['safe', 'fast', 'ultra'].includes(value) ? value : 'safe';
-}
 
 export function normalizeRabenStateMappings(value = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};

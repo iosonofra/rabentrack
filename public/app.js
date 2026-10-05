@@ -438,15 +438,19 @@ async function waitForRabenBeta(jobId) {
 
 async function loadRabenBeta() {
   rabenBetaSettings = await request('/api/raben-beta/config');
-  $('#raben-beta-enabled').checked = rabenBetaSettings.enabled;
-  $('#raben-camofox-url').value = rabenBetaSettings.camofoxUrl;
-  $('#raben-tracking-url').value = rabenBetaSettings.trackingUrl;
-  const speedProfile = normalizeUiRabenSpeedProfile(rabenBetaSettings.speedProfile);
-  const speedInput = document.querySelector(`input[name="raben-speed-profile"][value="${speedProfile}"]`);
-  if (speedInput) speedInput.checked = true;
+  applyRabenBetaSettingsToForm(rabenBetaSettings);
   updateControlServiceStatus();
   updateControlSelectionUi([...document.querySelectorAll('.control-row-select')].map((input) => ({ trackingNumber: input.dataset.tracking })));
   updateSettingsHealth();
+}
+
+function applyRabenBetaSettingsToForm(settings) {
+  $('#raben-beta-enabled').checked = Boolean(settings.enabled);
+  $('#raben-camofox-url').value = settings.camofoxUrl || '';
+  $('#raben-tracking-url').value = settings.trackingUrl || '';
+  const speedProfile = normalizeUiRabenSpeedProfile(settings.speedProfile);
+  const speedInput = document.querySelector(`input[name="raben-speed-profile"][value="${speedProfile}"]`);
+  if (speedInput) speedInput.checked = true;
 }
 
 function updateControlServiceStatus() {
@@ -5593,8 +5597,13 @@ $('#save-raben-beta').addEventListener('click', async () => {
   try {
     button.disabled = true;
     const speedProfile = document.querySelector('input[name="raben-speed-profile"]:checked')?.value || 'safe';
+    const supportedProfiles = Array.isArray(rabenBetaSettings?.speedProfiles) ? rabenBetaSettings.speedProfiles : ['safe', 'fast'];
+    if (!supportedProfiles.includes(speedProfile)) {
+      throw new Error('Il servizio backend in esecuzione non supporta ancora la modalità Ultra. Aggiorna i file e riavvia raben-tracking-center, quindi ricarica la pagina.');
+    }
     const data = await request('/api/raben-beta/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('#raben-beta-enabled').checked, camofoxUrl: $('#raben-camofox-url').value, trackingUrl: $('#raben-tracking-url').value, speedProfile }) });
-    rabenBetaSettings = data; updateControlServiceStatus(); updateSelectionUi(); updateControlSelectionUi([...document.querySelectorAll('.control-row-select')].map((input) => ({ trackingNumber: input.dataset.tracking })));
+    if (data.speedProfile !== speedProfile) throw new Error(`Il backend ha restituito il profilo ${data.speedProfile || 'affidabile'} invece di ${speedProfile}. Riavvia il servizio e riprova.`);
+    rabenBetaSettings = data; applyRabenBetaSettingsToForm(data); updateControlServiceStatus(); updateSelectionUi(); updateControlSelectionUi([...document.querySelectorAll('.control-row-select')].map((input) => ({ trackingNumber: input.dataset.tracking })));
     const modeLabel = rabenSpeedLabel(data.speedProfile);
     tell('#raben-config-message', data.enabled ? `Servizio attivo in modalità ${modeLabel}. Una spedizione alla volta, pausa media ${data.intervalMs / 1000} secondi.` : 'Configurazione salvata; servizio disattivato.', 'success');
     markSettingsClean('connections');

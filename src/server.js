@@ -199,7 +199,7 @@ app.post('/api/backup/restore', upload.single('file'), async (req, res) => {
 function rabenBetaConfigResponse() {
   const profile = Raben_SPEED_PROFILES[connection.rabenBeta?.speedProfile] || Raben_SPEED_PROFILES.safe;
   const intervalMs = Math.round((profile.manualDelayMs[0] + profile.manualDelayMs[1]) / 2);
-  return { ...connection.rabenBeta, maxRows: Raben_BETA_MAX_ROWS, batchSize: Raben_BETA_BATCH_SIZE, intervalMs, cacheHours: Raben_BETA_CACHE_TTL_MS / 3_600_000, movingCacheHours: Raben_MOVING_CACHE_TTL_MS / 3_600_000, parserVersion: Raben_PARSER_VERSION };
+  return { ...connection.rabenBeta, speedProfiles: Object.keys(Raben_SPEED_PROFILES), maxRows: Raben_BETA_MAX_ROWS, batchSize: Raben_BETA_BATCH_SIZE, intervalMs, cacheHours: Raben_BETA_CACHE_TTL_MS / 3_600_000, movingCacheHours: Raben_MOVING_CACHE_TTL_MS / 3_600_000, parserVersion: Raben_PARSER_VERSION };
 }
 
 app.get('/api/raben-beta/config', (_req, res) => {
