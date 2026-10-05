@@ -211,6 +211,13 @@ curl --fail --silent --show-error -X POST http://127.0.0.1:9377/start
 L'endpoint `/health` verifica il servizio HTTP, mentre `/start` verifica anche che il browser possa essere avviato. Entrambi sono locali e non richiedono la chiave di accesso. Se `/start` restituisce un errore:
 
 ```bash
+tail -n 100 /var/log/camofox.err
+tail -n 100 /var/log/camofox.log
+```
+
+L'installazione applica automaticamente uno strato di compatibilità fra `camoufox-js` e lo schema del binario Camoufox installato. Non modificare manualmente `properties.json`: il comando `npm ci` ripristina e applica in modo ripetibile la correzione tramite `postinstall`.
+
+```bash
 journalctl -u camofox -n 100 --no-pager
 ```
 
