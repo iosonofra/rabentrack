@@ -6,7 +6,7 @@ const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const settingsPath = join(projectRoot, 'data', 'settings.json');
 
 export function normalizeRabenSpeedProfile(value) {
-  return value === 'fast' ? 'fast' : 'safe';
+  return ['safe', 'fast', 'ultra'].includes(value) ? value : 'safe';
 }
 
 export function normalizeRabenStateMappings(value = {}) {

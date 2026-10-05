@@ -212,7 +212,9 @@ export class RabenCronService {
         completed: 0,
         total: candidates.length,
         currentTracking: candidates[0].trackingNumber,
-        speedProfile: rabenBetaConfig.speedProfile === 'fast' ? 'fast' : 'safe',
+        speedProfile: rabenBetaConfig.speedProfile || 'safe',
+        effectiveSpeedProfile: rabenBetaConfig.speedProfile || 'safe',
+        fallbackReason: '',
       };
 
       betaClient = this.rabenBetaClientFactory(rabenBetaConfig);
@@ -298,6 +300,12 @@ export class RabenCronService {
         }
 
         this.activeProgress.completed = i + 1;
+        const runtimeProfile = betaClient.getRuntimeProfile?.();
+        if (runtimeProfile) {
+          this.activeProgress.speedProfile = runtimeProfile.requested;
+          this.activeProgress.effectiveSpeedProfile = runtimeProfile.effective;
+          this.activeProgress.fallbackReason = runtimeProfile.fallbackReason;
+        }
 
         // Pacing anti-blocco tra le richieste se ce ne sono altre
         if (i < candidates.length - 1 && !this.cancelRequested) {

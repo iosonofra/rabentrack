@@ -11,16 +11,18 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const TRACKING_POLL_TIMEOUT_MS = 18_000;
 const TRACKING_POLL_INTERVAL_MS = 700;
 const FAST_TRACKING_POLL_INTERVALS_MS = [250, 500, 800, 1200];
+const ULTRA_TRACKING_POLL_INTERVALS_MS = [100, 200, 350, 600];
 export const Raben_PARSER_VERSION = 8;
 export const DEFAULT_Raben_TRACKING_URL = 'https://oftc.myraben.com/link/ShipmentInformation?ShipmentNumber=TRACKINGDAINSERIRE&Language=IT';
 
 export const Raben_SPEED_PROFILES = Object.freeze({
   safe: Object.freeze({ id: 'safe', reuseTab: false, initialDelayMs: 500, manualDelayMs: [2000, 3200], cronDelayMs: [4000, 6000] }),
   fast: Object.freeze({ id: 'fast', reuseTab: true, initialDelayMs: 150, manualDelayMs: [1200, 2000], cronDelayMs: [1800, 3000] }),
+  ultra: Object.freeze({ id: 'ultra', reuseTab: true, initialDelayMs: 50, manualDelayMs: [350, 700], cronDelayMs: [700, 1200] }),
 });
 
 export function normalizeRabenSpeedProfile(value) {
-  return value === 'fast' ? 'fast' : 'safe';
+  return ['safe', 'fast', 'ultra'].includes(value) ? value : 'safe';
 }
 
 function assertLoopback(value) {
@@ -238,7 +240,7 @@ export class RabenBetaClient {
     this.activeTabId = '';
     this.cookieConsentChecked = false;
     this.activeSessionKey = `raben-session-${randomUUID()}`;
-    if (this.requestedSpeedProfile === 'fast') {
+    if (this.requestedSpeedProfile !== 'safe') {
       this.effectiveSpeedProfile = 'safe';
       this.fallbackReason = reason;
     }
@@ -276,11 +278,20 @@ export class RabenBetaClient {
     const accessGuard = result?.reasonCode === 'ACCESS_GUARD' || result?.status === 'Intervento manuale richiesto';
     const unstable = result?.status === 'Da verificare manualmente' || result?.reasonCode === 'STATUS_TIMEOUT';
     this.unstableResultCount = unstable ? this.unstableResultCount + 1 : 0;
-    if (this.effectiveSpeedProfile === 'fast' && (accessGuard || this.unstableResultCount >= 2)) {
+    if (accessGuard && this.effectiveSpeedProfile !== 'safe') {
       this.effectiveSpeedProfile = 'safe';
-      this.fallbackReason = accessGuard
-        ? 'Modalità affidabile attivata dopo un blocco o una verifica richiesta da Raben.'
-        : 'Modalità affidabile attivata dopo due risultati consecutivi non stabili.';
+      this.fallbackReason = 'Modalità affidabile attivata dopo un blocco o una verifica richiesta da Raben.';
+      return;
+    }
+    if (this.effectiveSpeedProfile === 'ultra' && unstable) {
+      this.effectiveSpeedProfile = 'fast';
+      this.unstableResultCount = 0;
+      this.fallbackReason = 'Modalità rapida attivata dopo un risultato non stabile in modalità ultra.';
+      return;
+    }
+    if (this.effectiveSpeedProfile === 'fast' && this.unstableResultCount >= 2) {
+      this.effectiveSpeedProfile = 'safe';
+      this.fallbackReason = 'Modalità affidabile attivata dopo due risultati consecutivi non stabili.';
     }
   }
 
@@ -381,7 +392,10 @@ export class RabenBetaClient {
 
   async waitForTrackingResult(tabId, snapshot) {
     const deadline = Date.now() + TRACKING_POLL_TIMEOUT_MS;
-    const fastMode = this.effectiveSpeedProfile === 'fast';
+    const acceleratedMode = this.effectiveSpeedProfile !== 'safe';
+    const pollIntervals = this.effectiveSpeedProfile === 'ultra'
+      ? ULTRA_TRACKING_POLL_INTERVALS_MS
+      : FAST_TRACKING_POLL_INTERVALS_MS;
     let best = null;
     let stableStatus = '';
     let stableReads = 0;
@@ -391,7 +405,7 @@ export class RabenBetaClient {
       const domEvidence = await this.extractDomEvidence(tabId).catch(() => lastEvidence);
       lastEvidence = domEvidence;
       const domResult = parseRabenDomEvidence(domEvidence);
-      if (fastMode && domResult?.status !== 'Da verificare manualmente' && domResult?.confidence >= .9) {
+      if (acceleratedMode && domResult?.status !== 'Da verificare manualmente' && domResult?.confidence >= .9) {
         return { result: domResult, timeline: domEvidence.timeline, summary: domEvidence.summary };
       }
       const page = await snapshot();
@@ -404,8 +418,8 @@ export class RabenBetaClient {
         if (current.confidence >= .9 || stableReads >= 2) return { result: current, timeline: domEvidence.timeline, summary: domEvidence.summary };
       }
       if (Date.now() < deadline) {
-        const delayMs = fastMode
-          ? FAST_TRACKING_POLL_INTERVALS_MS[Math.min(pollIndex, FAST_TRACKING_POLL_INTERVALS_MS.length - 1)]
+        const delayMs = acceleratedMode
+          ? pollIntervals[Math.min(pollIndex, pollIntervals.length - 1)]
           : TRACKING_POLL_INTERVAL_MS;
         pollIndex += 1;
         await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -435,7 +449,7 @@ export class RabenBetaClient {
     try {
       await new Promise((resolve) => setTimeout(resolve, Raben_SPEED_PROFILES[this.effectiveSpeedProfile].initialDelayMs));
       const directUrl = this.settings.trackingUrl.includes('TRACKINGDAINSERIRE');
-      const shouldInspectEntryPage = this.effectiveSpeedProfile !== 'fast' || !directUrl || !this.cookieConsentChecked;
+      const shouldInspectEntryPage = this.effectiveSpeedProfile === 'safe' || !directUrl || !this.cookieConsentChecked;
       let page = '';
       if (shouldInspectEntryPage) {
         page = await snapshot();

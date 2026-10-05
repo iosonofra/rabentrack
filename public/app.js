@@ -16,6 +16,12 @@ let controlCheckSort = 'desc';
 const PRESTA_UNLINKED_FILTER = '__unlinked__';
 const PRESTA_UNAVAILABLE_FILTER = '__unavailable__';
 const CONTROL_PAGE_SIZE = 50;
+const RABEN_SPEED_LABELS = Object.freeze({ safe: 'Affidabile', fast: 'Rapido controllato', ultra: 'Ultra controllato' });
+const RABEN_SPEED_SHORT_LABELS = Object.freeze({ safe: 'Affidabile', fast: 'Rapida', ultra: 'Ultra' });
+const RABEN_SPEED_MODE_LABELS = Object.freeze({ safe: 'affidabile', fast: 'rapida controllata', ultra: 'ultra controllata' });
+const normalizeUiRabenSpeedProfile = (value) => Object.hasOwn(RABEN_SPEED_LABELS, value) ? value : 'safe';
+const rabenSpeedLabel = (value, short = false) => (short ? RABEN_SPEED_SHORT_LABELS : RABEN_SPEED_LABELS)[normalizeUiRabenSpeedProfile(value)];
+const rabenSpeedModeLabel = (value) => RABEN_SPEED_MODE_LABELS[normalizeUiRabenSpeedProfile(value)];
 let controlOverview = { records: [], total: 0, counts: {} };
 let activeControlTrackingNumber = '';
 let controlDetailTrigger = null;
@@ -435,7 +441,7 @@ async function loadRabenBeta() {
   $('#raben-beta-enabled').checked = rabenBetaSettings.enabled;
   $('#raben-camofox-url').value = rabenBetaSettings.camofoxUrl;
   $('#raben-tracking-url').value = rabenBetaSettings.trackingUrl;
-  const speedProfile = rabenBetaSettings.speedProfile === 'fast' ? 'fast' : 'safe';
+  const speedProfile = normalizeUiRabenSpeedProfile(rabenBetaSettings.speedProfile);
   const speedInput = document.querySelector(`input[name="raben-speed-profile"][value="${speedProfile}"]`);
   if (speedInput) speedInput.checked = true;
   updateControlServiceStatus();
@@ -448,8 +454,8 @@ function updateControlServiceStatus() {
   if (!status) return;
   const enabled = Boolean(rabenBetaSettings?.enabled);
   status.dataset.state = enabled ? 'ready' : 'off';
-  const speedLabel = rabenBetaSettings?.speedProfile === 'fast' ? 'modalità rapida' : 'modalità affidabile';
-  status.textContent = enabled ? `Raben tracking attivo · ${speedLabel}` : 'Raben tracking non attivo';
+  const speedLabel = rabenSpeedModeLabel(rabenBetaSettings?.speedProfile);
+  status.textContent = enabled ? `Raben tracking attivo · modalità ${speedLabel}` : 'Raben tracking non attivo';
 }
 
 function controlBadge(status) {
@@ -940,7 +946,7 @@ function updateControlRabenProgress(progress, context = {}) {
   const completed = Math.min(total, Number(progress.completed || 0));
   const percentage = total ? Math.round((completed / total) * 100) : 0;
   const jobState = context.jobStatus || progress.phase || 'running';
-  const fallbackActive = Boolean(progress.fallbackReason) || (progress.requestedSpeedProfile === 'fast' && progress.effectiveSpeedProfile === 'safe');
+  const fallbackActive = Boolean(progress.fallbackReason) || normalizeUiRabenSpeedProfile(progress.requestedSpeedProfile) !== normalizeUiRabenSpeedProfile(progress.effectiveSpeedProfile);
   const phaseLabels = {
     queued: 'In coda: attesa disponibilità Camoufox',
     preparing: 'Preparazione browser Camoufox',
@@ -977,7 +983,7 @@ function updateControlRabenProgress(progress, context = {}) {
   tracking.hidden = !progress.currentTracking;
 
   const mode = $('#control-raben-progress-mode');
-  mode.textContent = effectiveMode === 'fast' ? 'Modalità rapida' : fallbackActive ? 'Modalità affidabile · fallback' : 'Modalità affidabile';
+  mode.textContent = `Modalità ${rabenSpeedModeLabel(effectiveMode)}${fallbackActive ? ' · fallback' : ''}`;
   mode.title = progress.fallbackReason || '';
   mode.classList.toggle('fallback', fallbackActive);
 
@@ -1569,7 +1575,7 @@ function renderCronStatus(status) {
   if (indicator) {
     if (status.isRunning) {
       indicator.className = 'status-indicator running';
-      indicator.textContent = `In esecuzione · ${status.activeProgress?.speedProfile === 'fast' ? 'Rapida' : 'Affidabile'}`;
+      indicator.textContent = `In esecuzione · ${rabenSpeedLabel(status.activeProgress?.effectiveSpeedProfile || status.activeProgress?.speedProfile, true)}`;
     } else if (status.isNightPaused) {
       indicator.className = 'status-indicator paused';
       indicator.textContent = 'Pausa notturna';
@@ -1654,7 +1660,7 @@ function renderCronStatus(status) {
         ? `<span style="color:var(--danger)"> · ${s.errors} con errore</span>`
         : '';
       const cancelledText = s.type === 'cancelled' ? ' <span style="color:var(--warning)">(Interrotta dall’operatore)</span>' : '';
-      const profileText = s.effectiveSpeedProfile === 'fast' ? 'Rapido controllato' : 'Affidabile';
+      const profileText = rabenSpeedLabel(s.effectiveSpeedProfile);
       const fallbackText = s.fallbackReason ? `<li class="cron-profile-fallback">${escapeHtml(s.fallbackReason)}</li>` : '';
 
       summaryList.innerHTML = `
@@ -2186,7 +2192,7 @@ function setupWorkspace() {
     if (trackingHint) trackingHint.innerHTML = 'Il valore <code>TRACKINGDAINSERIRE</code> viene sostituito automaticamente per ogni spedizione.';
     const speedPicker = document.createElement('fieldset');
     speedPicker.className = 'camofox-speed-picker';
-    speedPicker.innerHTML = '<legend>Velocità delle verifiche</legend><div class="camofox-speed-options"><label class="camofox-speed-option"><input id="raben-speed-safe" name="raben-speed-profile" type="radio" value="safe" checked><span><strong>Affidabile <small>Consigliato</small></strong><span>Una nuova scheda per ogni spedizione e pause più ampie.</span></span></label><label class="camofox-speed-option"><input id="raben-speed-fast" name="raben-speed-profile" type="radio" value="fast"><span><strong>Rapido controllato</strong><span>Riutilizza la scheda e riduce le attese. Torna automaticamente alla modalità affidabile se Raben diventa instabile.</span></span></label></div><p class="camofox-speed-note">Entrambi i profili elaborano una sola spedizione alla volta. La modifica si applica dal ciclo successivo.</p>';
+    speedPicker.innerHTML = '<legend>Velocità delle verifiche</legend><div class="camofox-speed-options"><label class="camofox-speed-option"><input id="raben-speed-safe" name="raben-speed-profile" type="radio" value="safe" checked><span><strong>Affidabile <small>Consigliato</small></strong><span>Una nuova scheda per ogni spedizione e pause più ampie.</span></span></label><label class="camofox-speed-option"><input id="raben-speed-fast" name="raben-speed-profile" type="radio" value="fast"><span><strong>Rapido controllato</strong><span>Riutilizza la scheda e riduce le attese. Passa ad Affidabile se Raben diventa instabile.</span></span></label><label class="camofox-speed-option"><input id="raben-speed-ultra" name="raben-speed-profile" type="radio" value="ultra"><span><strong>Ultra controllato <small>Più veloce</small></strong><span>Riduce al minimo le attese. In caso di instabilità passa prima a Rapido, poi ad Affidabile.</span></span></label></div><p class="camofox-speed-note">Tutti i profili elaborano una sola spedizione alla volta. La modifica si applica dal ciclo successivo.</p>';
     betaConfig?.insertAdjacentElement('afterend', speedPicker);
     const importActions = importCard.querySelector(':scope > .actions');
     const verifyRabenButton = $('#verify-raben-beta');
@@ -5589,7 +5595,7 @@ $('#save-raben-beta').addEventListener('click', async () => {
     const speedProfile = document.querySelector('input[name="raben-speed-profile"]:checked')?.value || 'safe';
     const data = await request('/api/raben-beta/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('#raben-beta-enabled').checked, camofoxUrl: $('#raben-camofox-url').value, trackingUrl: $('#raben-tracking-url').value, speedProfile }) });
     rabenBetaSettings = data; updateControlServiceStatus(); updateSelectionUi(); updateControlSelectionUi([...document.querySelectorAll('.control-row-select')].map((input) => ({ trackingNumber: input.dataset.tracking })));
-    const modeLabel = data.speedProfile === 'fast' ? 'Rapido controllato' : 'Affidabile';
+    const modeLabel = rabenSpeedLabel(data.speedProfile);
     tell('#raben-config-message', data.enabled ? `Servizio attivo in modalità ${modeLabel}. Una spedizione alla volta, pausa media ${data.intervalMs / 1000} secondi.` : 'Configurazione salvata; servizio disattivato.', 'success');
     markSettingsClean('connections');
     updateSettingsHealth();
@@ -5620,7 +5626,7 @@ $('#verify-raben-beta').addEventListener('click', async () => {
   if (!confirm(`Avvia la verifica Raben per ${selected.length} spedizioni? Non verrà modificato alcun ordine.`)) return;
   try {
     $('#verify-raben-beta').disabled = true; updateRabenProgress({ completed: 0, total: selected.length });
-    tell('#raben-beta-message', `Verifica sequenziale in corso · ${rabenBetaSettings.speedProfile === 'fast' ? 'modalità rapida' : 'modalità affidabile'}.`);
+    tell('#raben-beta-message', `Verifica sequenziale in corso · modalità ${rabenSpeedModeLabel(rabenBetaSettings.speedProfile)}.`);
     const { jobId } = await request('/api/raben-beta/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trackingNumbers: selected.map((row) => row.trackingNumber) }) });
     const { results, safeguards } = await waitForRabenBeta(jobId);
     const byTracking = new Map(results.map((result) => [result.trackingNumber, result]));
@@ -5628,7 +5634,7 @@ $('#verify-raben-beta').addEventListener('click', async () => {
     renderRows(previewRows, 'verification'); updateSelectionUi(); void refreshControlCenter();
     const cached = results.filter((row) => row.cached).length;
     const fallback = safeguards.fallbackReason ? ` ${safeguards.fallbackReason}` : '';
-    tell('#raben-beta-message', `${results.length} spedizioni controllate${cached ? `, ${cached} da cache` : ''}. Modalità effettiva: ${safeguards.effectiveSpeedProfile === 'fast' ? 'rapida' : 'affidabile'}.${fallback}`, safeguards.fallbackReason ? 'warning' : 'success');
+    tell('#raben-beta-message', `${results.length} spedizioni controllate${cached ? `, ${cached} da cache` : ''}. Modalità effettiva: ${rabenSpeedModeLabel(safeguards.effectiveSpeedProfile)}.${fallback}`, safeguards.fallbackReason ? 'warning' : 'success');
   } catch (e) { tell('#raben-beta-message', e.message, 'error'); }
   finally { $('#verify-raben-beta').disabled = false; }
 });
