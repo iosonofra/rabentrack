@@ -2,7 +2,10 @@ import 'dotenv/config';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const serverPath = fileURLToPath(new URL('../node_modules/@askjo/camofox-browser/server.js', import.meta.url));
+// Avvia il server tramite il nostro bootstrap di compatibilità. Camoufox può
+// rimuovere proprietà dal proprio schema prima che camoufox-js aggiorni la
+// mappatura BrowserForge (per esempio navigator.product in v156).
+const serverPath = fileURLToPath(new URL('./run-camofox-server.js', import.meta.url));
 const environment = {
   ...process.env,
   CAMOFOX_PORT: process.env.CAMOFOX_PORT || '9377',

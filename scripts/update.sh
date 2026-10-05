@@ -51,7 +51,13 @@ npm ci --omit=dev || npm install --omit=dev
 
 if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then
     echo "Aggiornamento del browser Camoufox..."
-    CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" npx camoufox-js fetch
+    mkdir -p "${APP_DIR}/.cache/camoufox"
+    if [ "$(id -u)" -eq 0 ] && id raben >/dev/null 2>&1; then
+        chown -R raben:raben "${APP_DIR}/.cache/camoufox"
+        runuser -u raben -- env CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
+    else
+        CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
+    fi
 fi
 
 # Preserva permessi
@@ -67,7 +73,26 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
     systemctl daemon-reload 2>/dev/null || true
     if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then
-        systemctl restart camofox || true
+        systemctl restart camofox
+        CAMOFOX_READY=""
+        ATTEMPT=1
+        while [ "${ATTEMPT}" -le 12 ]; do
+            CAMOFOX_READY="$(curl --fail --silent --show-error -X POST http://127.0.0.1:9377/start 2>/dev/null || true)"
+            case "${CAMOFOX_READY}" in
+                *'"ok":true'*) break ;;
+            esac
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 1
+        done
+        case "${CAMOFOX_READY}" in
+            *'"ok":true'*) ;;
+            *)
+                echo "Errore: Camofox risponde, ma il browser non riesce ad avviarsi." >&2
+                echo "Risposta: ${CAMOFOX_READY:-nessuna risposta}" >&2
+                journalctl -u camofox -n 40 --no-pager >&2 || true
+                exit 1
+                ;;
+        esac
         echo "${GREEN}Servizio Camofox riavviato.${NC}"
     fi
     systemctl restart raben-tracking-center

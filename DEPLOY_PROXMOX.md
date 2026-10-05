@@ -205,9 +205,10 @@ Entrambi devono rispondere `active`.
 
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:9377/health
+curl --fail --silent --show-error -X POST http://127.0.0.1:9377/start
 ```
 
-L'endpoint `/health` non richiede la chiave di accesso. Se restituisce un errore:
+L'endpoint `/health` verifica il servizio HTTP, mentre `/start` verifica anche che il browser possa essere avviato. Entrambi sono locali e non richiedono la chiave di accesso. Se `/start` restituisce un errore:
 
 ```bash
 journalctl -u camofox -n 100 --no-pager

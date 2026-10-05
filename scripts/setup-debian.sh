@@ -104,7 +104,8 @@ echo -e "${YELLOW}==> 4/6 Installazione dipendenze Node.js e browser Camoufox...
 if [ "${INSTALL_CAMOFOX}" = "true" ] || [ "${INSTALL_CAMOFOX}" = "1" ]; then
     npm install --omit=dev
     echo "Download binario browser Camoufox (glibc nativo per Linux x86_64)..."
-    CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" npx camoufox-js fetch || true
+    chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}/.cache/camoufox"
+    runuser -u "${APP_USER}" -- env CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
 else
     npm ci --omit=dev --omit=optional || npm install --omit=dev --omit=optional
 fi

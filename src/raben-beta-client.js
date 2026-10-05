@@ -340,7 +340,9 @@ export class RabenBetaClient {
   }
 
   async testConnection() {
-    await this.request('/health');
+    // /health conferma soltanto che il server HTTP risponde. /start verifica
+    // anche schema, binario, display virtuale e avvio effettivo del browser.
+    await this.request('/start', { method: 'POST' });
     return { ok: true };
   }
 
