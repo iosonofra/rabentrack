@@ -49,6 +49,10 @@ fi
 
 npm ci --omit=dev || npm install --omit=dev
 
+# Esecuzione esplicita: funziona anche quando npm è configurato con
+# ignore-scripts=true e rende visibile la correzione nel log di aggiornamento.
+node scripts/patch-camoufox-js.js
+
 if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then
     echo "Aggiornamento del browser Camoufox..."
     mkdir -p "${APP_DIR}/.cache/camoufox"

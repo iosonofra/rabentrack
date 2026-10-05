@@ -104,10 +104,12 @@ echo "${YELLOW}==> 5/7 Installazione dipendenze Node.js...${NC}"
 if [ "${INSTALL_CAMOFOX}" = "true" ] || [ "${INSTALL_CAMOFOX}" = "1" ]; then
     echo "Installazione completa con supporto Camofox..."
     npm install --omit=dev
+    node scripts/patch-camoufox-js.js
     echo "Download binario del browser Camoufox..."
     CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" npx camoufox-js fetch || true
 else
     npm ci --omit=dev --omit=optional || npm install --omit=dev --omit=optional
+    node scripts/patch-camoufox-js.js
 fi
 
 # Assegnazione permessi
