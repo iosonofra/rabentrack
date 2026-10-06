@@ -2,8 +2,28 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
+import { CRON_PRESETS, CRON_TIME_ZONE, parseCronExpression } from './cron-scheduler.js';
 
 export { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
+
+export const RABEN_CRON_STATE_PRIORITIES = Object.freeze({
+  'In consegna': 'high',
+  'Eccezione Raben': 'high',
+  'Non verificato': 'medium',
+  'Caricata': 'medium',
+  'In transito': 'medium',
+  'Centro di distribuzione': 'medium',
+  'Registrata': 'low',
+  'Prenotata': 'low',
+  'Spedizione non trovata': 'low',
+  'Errore verifica': 'low',
+  'Da verificare manualmente': 'low',
+  'Intervento manuale richiesto': 'low',
+  'Consegnata con riserva': 'excluded',
+  'Consegnata': 'excluded',
+});
+
+const CRON_TIERS = new Set(['high', 'medium', 'low', 'excluded']);
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const settingsPath = join(projectRoot, 'data', 'settings.json');
@@ -53,13 +73,52 @@ export function normalizeNotificationSettings(input = {}) {
 
 export function normalizeCronSettings(input = {}) {
   const enabled = Boolean(input.enabled);
+  const scheduleMode = input.scheduleMode === 'cron' ? 'cron' : 'interval';
   const intervalMinutes = Math.min(Math.max(Number(input.intervalMinutes) || 60, 15), 1440);
+  const defaultExpression = CRON_PRESETS[0].expression;
+  const cronExpression = String(input.cronExpression || defaultExpression).trim().replace(/\s+/g, ' ').slice(0, 120);
+  if (scheduleMode === 'cron') parseCronExpression(cronExpression);
+  const presetIds = new Set(CRON_PRESETS.map((preset) => preset.id));
+  const cronPreset = presetIds.has(String(input.cronPreset || '')) ? String(input.cronPreset) : '';
   const nightPause = input.nightPause !== undefined ? Boolean(input.nightPause) : true;
   const startHour = Math.min(Math.max(Number(input.startHour) || 8, 0), 23);
   const endHour = Math.min(Math.max(Number(input.endHour) || 20, 0), 23);
   const batchSize = Math.min(Math.max(Number(input.batchSize) || 25, 1), 100);
   const minCheckIntervalHours = Math.min(Math.max(Number(input.minCheckIntervalHours) || 2, 0.5), 72);
-  return { enabled, intervalMinutes, nightPause, startHour, endHour, batchSize, minCheckIntervalHours };
+  const rawPriorities = input.statePriorities && typeof input.statePriorities === 'object' && !Array.isArray(input.statePriorities)
+    ? input.statePriorities
+    : {};
+  const statePriorities = { ...RABEN_CRON_STATE_PRIORITIES };
+  for (const [status, tier] of Object.entries(rawPriorities).slice(0, 100)) {
+    const normalizedStatus = String(status || '').trim().slice(0, 160);
+    if (normalizedStatus && CRON_TIERS.has(tier)) statePriorities[normalizedStatus] = tier;
+  }
+  // Gli stati finali Raben non vengono mai interrogati nuovamente dal cron.
+  statePriorities.Consegnata = 'excluded';
+  statePriorities['Consegnata con riserva'] = 'excluded';
+  const rawIntervals = input.tierMinIntervalHours && typeof input.tierMinIntervalHours === 'object'
+    ? input.tierMinIntervalHours
+    : {};
+  const tierMinIntervalHours = {
+    high: Math.min(Math.max(Number(rawIntervals.high) || 1, 0.5), 72),
+    medium: Math.min(Math.max(Number(rawIntervals.medium) || 4, 0.5), 168),
+    low: Math.min(Math.max(Number(rawIntervals.low) || 8, 0.5), 336),
+  };
+  return {
+    enabled,
+    scheduleMode,
+    intervalMinutes,
+    cronExpression,
+    cronPreset,
+    timeZone: CRON_TIME_ZONE,
+    nightPause,
+    startHour,
+    endHour,
+    batchSize,
+    minCheckIntervalHours,
+    statePriorities,
+    tierMinIntervalHours,
+  };
 }
 
 export async function loadSettings(defaults) {

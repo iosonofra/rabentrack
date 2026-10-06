@@ -8,6 +8,7 @@ import { PrestaShopClient } from './prestashop-client.js';
 import { exportSettingsData, loadSettings, normalizeCronSettings, normalizeRabenStateMappings, normalizeNotificationSettings, restoreSettingsData, saveSettings } from './settings-store.js';
 import { DEFAULT_Raben_TRACKING_URL, Raben_PARSER_VERSION, Raben_SPEED_PROFILES, RabenBetaClient, normalizeBetaSettings } from './raben-beta-client.js';
 import { RabenCronService } from './raben-cron.js';
+import { CRON_PRESETS, CRON_TIME_ZONE, previewCronExpression } from './cron-scheduler.js';
 import { NotificationService } from './notification-service.js';
 import { archiveShipment, deleteArchivedShipment, deleteImportBatch, exportShipmentsData, getAuditLog, getControlCenter, getExistingShipmentsIndex, getImportBatches, getShipment, linkShipmentToPrestaShopOrder, registerImportBatch, restoreShipmentsData, syncAppliedShipments, syncRabenShipments, syncManualPrestaShopState, syncShipmentPrestaShopShipping, syncVerifiedShipments, updateShipmentCase } from './shipment-store.js';
 
@@ -34,7 +35,7 @@ let connection = await loadSettings({
   baseUrl: process.env.PRESTASHOP_URL ?? '',
   apiKey: process.env.PRESTASHOP_WEBSERVICE_KEY ?? '',
   rabenBeta: { enabled: false, camofoxUrl: process.env.CAMOFOX_URL ?? 'http://127.0.0.1:9377', trackingUrl: process.env.RABEN_TRACKING_URL ?? DEFAULT_Raben_TRACKING_URL, speedProfile: 'safe' },
-  cron: { enabled: false, intervalMinutes: 60, nightPause: true, startHour: 8, endHour: 20, batchSize: 25, minCheckIntervalHours: 2 },
+  cron: normalizeCronSettings({ enabled: false, intervalMinutes: 60, nightPause: true, startHour: 8, endHour: 20, batchSize: 25 }),
   notifications: normalizeNotificationSettings({}),
 });
 
@@ -295,6 +296,25 @@ app.post('/api/raben-beta/jobs/:jobId/cancel', (req, res) => {
 
 app.get('/api/cron/status', (_req, res) => {
   res.json(cronService.getStatus());
+});
+
+app.get('/api/cron/presets', (_req, res) => {
+  res.json({
+    timeZone: CRON_TIME_ZONE,
+    presets: CRON_PRESETS.map((preset) => ({
+      ...preset,
+      description: previewCronExpression(preset.expression, { count: 1 }).description,
+    })),
+  });
+});
+
+app.get('/api/cron/preview', (req, res) => {
+  try {
+    const expression = String(req.query.expression || '').trim();
+    res.json(previewCronExpression(expression, { count: 5, timeZone: CRON_TIME_ZONE }));
+  } catch (error) {
+    res.status(400).json({ valid: false, error: error.message, nextRuns: [] });
+  }
 });
 
 app.post('/api/cron/config', async (req, res) => {

@@ -40,6 +40,7 @@ const INCLUDED_ROOT_FILES = [
   '.env.example',
   '.gitignore',
   'README.md',
+  '006-cron-priorita-orari.md',
   'DEPLOY_PROXMOX.md',
   'DESIGN.md',
   'PRODUCT.md'

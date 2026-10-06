@@ -1,8 +1,32 @@
 import { normalizeStoredRabenStatus } from './shipment-store.js';
+import { CRON_TIME_ZONE, describeCronExpression, getNextCronOccurrence, getNextCronOccurrences } from './cron-scheduler.js';
+
+const TIER_RANK = Object.freeze({ high: 1, medium: 2, low: 3 });
+const FALLBACK_STATE_PRIORITIES = Object.freeze({
+  'In consegna': 'high',
+  'Eccezione Raben': 'high',
+  'Non verificato': 'medium',
+  'Caricata': 'medium',
+  'In transito': 'medium',
+  'Centro di distribuzione': 'medium',
+  'Registrata': 'low',
+  'Prenotata': 'low',
+  'Spedizione non trovata': 'low',
+  'Errore verifica': 'low',
+  'Da verificare manualmente': 'low',
+  'Intervento manuale richiesto': 'low',
+  'Consegnata con riserva': 'excluded',
+  'Consegnata': 'excluded',
+});
+
+function hourInTimeZone(date, timeZone = CRON_TIME_ZONE) {
+  return Number(new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', hourCycle: 'h23' }).format(date));
+}
 
 export function isWithinActiveHours(config = {}, date = new Date()) {
+  if (config.scheduleMode === 'cron') return true;
   if (!config.nightPause) return true;
-  const hour = date.getHours();
+  const hour = hourInTimeZone(date, config.timeZone || CRON_TIME_ZONE);
   const start = Number(config.startHour ?? 8);
   const end = Number(config.endHour ?? 20);
   if (start <= end) {
@@ -14,31 +38,41 @@ export function isWithinActiveHours(config = {}, date = new Date()) {
 
 export function selectCronCandidates(shipments = {}, options = {}) {
   const records = Array.isArray(shipments) ? shipments : Object.values(shipments || {});
-  const minIntervalMs = (Number(options.minCheckIntervalHours) || 2) * 3_600_000;
   const batchSize = Math.max(1, Number(options.batchSize) || 25);
-  const now = Date.now();
+  const now = options.now instanceof Date ? options.now.getTime() : Number(options.now) || Date.now();
+  const statePriorities = { ...FALLBACK_STATE_PRIORITIES, ...(options.statePriorities || {}) };
+  const tierIntervals = {
+    high: Number(options.tierMinIntervalHours?.high) || 1,
+    medium: Number(options.tierMinIntervalHours?.medium) || 4,
+    low: Number(options.tierMinIntervalHours?.low) || 8,
+  };
 
-  const candidates = records.filter((record) => {
-    if (!record || !record.trackingNumber) return false;
-    if (record.archived) return false;
-    const status = normalizeStoredRabenStatus(record.rabenStatus);
-    if (status === 'Consegnata') return false;
+  const candidates = records.flatMap((record) => {
+    if (!record || !record.trackingNumber) return [];
+    if (record.archived) return [];
+    const status = normalizeStoredRabenStatus(record.rabenStatus) || 'Non verificato';
+    const tier = statePriorities[status] || 'medium';
+    if (tier === 'excluded' || !TIER_RANK[tier]) return [];
 
-    // Se controllata di recente, salta per evitare richieste ridondanti (salvo forza manuale)
+    const minIntervalMs = tierIntervals[tier] * 3_600_000;
+    let checkedTime = 0;
     if (!options.force && record.rabenCheckedAt) {
-      const checkedTime = new Date(record.rabenCheckedAt).getTime();
+      checkedTime = new Date(record.rabenCheckedAt).getTime();
       if (!Number.isNaN(checkedTime) && (now - checkedTime) < minIntervalMs) {
-        return false;
+        return [];
       }
     }
-    return true;
+    if (record.rabenCheckedAt && !checkedTime) {
+      const parsed = new Date(record.rabenCheckedAt).getTime();
+      checkedTime = Number.isNaN(parsed) ? 0 : parsed;
+    }
+    return [{ ...record, cronTier: tier, cronTierRank: TIER_RANK[tier], cronCheckedTime: checkedTime }];
   });
 
-  // Ordina: prima le spedizioni mai controllate, poi quelle controllate più tempo fa
+  // Prima le urgenze Raben; nella stessa fascia, prima le mai controllate e le più vecchie.
   candidates.sort((a, b) => {
-    const timeA = a.rabenCheckedAt ? new Date(a.rabenCheckedAt).getTime() : 0;
-    const timeB = b.rabenCheckedAt ? new Date(b.rabenCheckedAt).getTime() : 0;
-    return timeA - timeB;
+    if (a.cronTierRank !== b.cronTierRank) return a.cronTierRank - b.cronTierRank;
+    return a.cronCheckedTime - b.cronCheckedTime;
   });
 
   return candidates.slice(0, batchSize);
@@ -73,6 +107,7 @@ export class RabenCronService {
     this.cancelRequested = false;
     this.lastRunAt = null;
     this.nextRunAt = null;
+    this.upcomingRuns = [];
     this.lastRunSummary = null;
     this.activeProgress = null;
     this.lastSlaCheckAt = 0;
@@ -87,23 +122,51 @@ export class RabenCronService {
       this.nextRunAt = null;
       return;
     }
-    const intervalMs = Math.max(15, Number(config.intervalMinutes) || 60) * 60_000;
-    this.nextRunAt = new Date(Date.now() + intervalMs).toISOString();
-
-    this.timer = setInterval(() => {
-      this.triggerScan({ manual: false }).catch((error) => {
-        this.logger.error('[Raben-CRON] Errore durante il ciclo automatico:', error.message);
-      });
-    }, intervalMs);
-
-    this.logger.log(`[Raben-CRON] Servizio avviato: controllo ogni ${config.intervalMinutes}m. Prossimo avvio: ${this.nextRunAt}`);
+    this.scheduleNextRun();
+    const scheduleLabel = config.scheduleMode === 'cron'
+      ? describeCronExpression(config.cronExpression)
+      : `ogni ${config.intervalMinutes} minuti`;
+    this.logger.log(`[Raben-CRON] Servizio avviato: ${scheduleLabel}. Prossimo avvio: ${this.nextRunAt}`);
   }
 
   stop() {
     if (this.timer) {
-      clearInterval(this.timer);
+      clearTimeout(this.timer);
       this.timer = null;
     }
+    this.nextRunAt = null;
+    this.upcomingRuns = [];
+  }
+
+  scheduleNextRun(fromDate = new Date()) {
+    const config = this.getSettings()?.cron || {};
+    if (!config.enabled) {
+      this.nextRunAt = null;
+      this.upcomingRuns = [];
+      return;
+    }
+    if (config.scheduleMode === 'cron') {
+      this.upcomingRuns = getNextCronOccurrences(config.cronExpression, fromDate, 5, config.timeZone || CRON_TIME_ZONE);
+    } else {
+      this.upcomingRuns = [new Date(fromDate.getTime() + Math.max(15, Number(config.intervalMinutes) || 60) * 60_000)];
+    }
+    const nextDate = this.upcomingRuns[0] || getNextCronOccurrence(config.cronExpression, fromDate, config.timeZone || CRON_TIME_ZONE);
+    this.nextRunAt = nextDate.toISOString();
+    const delay = Math.max(250, Math.min(nextDate.getTime() - Date.now(), 2_147_000_000));
+    this.timer = setTimeout(async () => {
+      this.timer = null;
+      if (Date.now() + 500 < nextDate.getTime()) {
+        this.scheduleNextRun(new Date());
+        return;
+      }
+      try {
+        await this.triggerScan({ manual: false });
+      } catch (error) {
+        this.logger.error('[Raben-CRON] Errore durante il ciclo automatico:', error.message);
+      } finally {
+        if (this.getSettings()?.cron?.enabled) this.scheduleNextRun(new Date());
+      }
+    }, delay);
   }
 
   async updateConfig(newConfig = {}) {
@@ -129,12 +192,20 @@ export class RabenCronService {
 
     return {
       enabled: Boolean(config.enabled),
+      scheduleMode: config.scheduleMode === 'cron' ? 'cron' : 'interval',
       intervalMinutes: Number(config.intervalMinutes) || 60,
+      cronExpression: config.cronExpression || '0 8-19 * * 1-5',
+      cronPreset: config.cronPreset || '',
+      timeZone: config.timeZone || CRON_TIME_ZONE,
+      scheduleDescription: config.scheduleMode === 'cron' ? describeCronExpression(config.cronExpression) : `Ogni ${Number(config.intervalMinutes) || 60} minuti`,
+      nextRuns: this.upcomingRuns.map((date) => date.toISOString()),
       nightPause: Boolean(config.nightPause),
       startHour: Number(config.startHour ?? 8),
       endHour: Number(config.endHour ?? 20),
       batchSize: Number(config.batchSize) || 25,
       minCheckIntervalHours: Number(config.minCheckIntervalHours) || 2,
+      statePriorities: config.statePriorities || FALLBACK_STATE_PRIORITIES,
+      tierMinIntervalHours: config.tierMinIntervalHours || { high: 1, medium: 4, low: 8 },
       isRunning: this.isRunning,
       isNightPaused: Boolean(config.enabled && config.nightPause && !withinHours),
       lastRunAt: this.lastRunAt,
@@ -170,9 +241,6 @@ export class RabenCronService {
           type: 'skipped',
           reason: `Pausa notturna attiva (orario attivo: ${config.startHour}:00 - ${config.endHour}:00)`,
         };
-        // Ricalcola il prossimo orario
-        const intervalMs = Math.max(15, Number(config.intervalMinutes) || 60) * 60_000;
-        this.nextRunAt = new Date(Date.now() + intervalMs).toISOString();
         return;
       }
     }
@@ -348,11 +416,6 @@ export class RabenCronService {
       this.cancelRequested = false;
       this.activeProgress = null;
 
-      // Ricalcola il prossimo orario se il timer è attivo
-      if (this.timer && config?.enabled) {
-        const intervalMs = Math.max(15, Number(config.intervalMinutes) || 60) * 60_000;
-        this.nextRunAt = new Date(Date.now() + intervalMs).toISOString();
-      }
     }
   }
 

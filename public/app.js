@@ -1510,6 +1510,103 @@ function setupBackupRestore() {
 
 let cronPollingTimer = null;
 let cronLastIsRunning = false;
+let cronPreviewTimer = null;
+let cronStatePriorities = {};
+
+const CRON_PRIORITY_DEFAULTS = Object.freeze({
+  'In consegna': 'high',
+  'Eccezione Raben': 'high',
+  'Non verificato': 'medium',
+  'Caricata': 'medium',
+  'In transito': 'medium',
+  'Centro di distribuzione': 'medium',
+  'Registrata': 'low',
+  'Prenotata': 'low',
+  'Spedizione non trovata': 'low',
+  'Errore verifica': 'low',
+  'Da verificare manualmente': 'low',
+  'Intervento manuale richiesto': 'low',
+  'Consegnata con riserva': 'excluded',
+  'Consegnata': 'excluded',
+});
+const CRON_TIER_ORDER = ['high', 'medium', 'low', 'excluded'];
+
+function renderCronPriorityMatrix(priorities = cronStatePriorities) {
+  cronStatePriorities = { ...CRON_PRIORITY_DEFAULTS, ...(priorities || {}) };
+  cronStatePriorities.Consegnata = 'excluded';
+  cronStatePriorities['Consegnata con riserva'] = 'excluded';
+
+  CRON_TIER_ORDER.forEach((tier) => {
+    const container = document.querySelector(`[data-cron-tier-states="${tier}"]`);
+    const count = document.querySelector(`[data-cron-tier-count="${tier}"]`);
+    if (!container) return;
+    const statuses = Object.entries(cronStatePriorities)
+      .filter(([, assignedTier]) => assignedTier === tier)
+      .map(([status]) => status)
+      .sort((a, b) => a.localeCompare(b, 'it'));
+    if (count) count.textContent = String(statuses.length);
+    container.innerHTML = statuses.length
+      ? statuses.map((status) => {
+        const locked = status === 'Consegnata' || status === 'Consegnata con riserva';
+        return `<button type="button" class="cron-state-chip${locked ? ' is-locked' : ''}" data-cron-status="${escapeHtml(status)}" draggable="${locked ? 'false' : 'true'}" ${locked ? 'aria-disabled="true"' : ''} title="${locked ? 'Stato finale Raben: escluso dai ricontrolli' : 'Clicca per spostare nella fascia successiva oppure trascina'}"><svg class="cron-chip-grip" viewBox="0 0 10 16" aria-hidden="true"><circle cx="3" cy="3" r="1"/><circle cx="7" cy="3" r="1"/><circle cx="3" cy="8" r="1"/><circle cx="7" cy="8" r="1"/><circle cx="3" cy="13" r="1"/><circle cx="7" cy="13" r="1"/></svg><span>${escapeHtml(status)}</span></button>`;
+      }).join('')
+      : '<span class="cron-tier-empty">Trascina qui uno stato</span>';
+  });
+}
+
+function moveCronPriorityStatus(status, targetTier) {
+  if (!status || !CRON_TIER_ORDER.includes(targetTier) || ['Consegnata', 'Consegnata con riserva'].includes(status)) return;
+  cronStatePriorities[status] = targetTier;
+  renderCronPriorityMatrix();
+  document.querySelector(`[data-cron-status="${CSS.escape(status)}"]`)?.classList.add('just-dropped');
+  markSettingsDirty('automation');
+  updateCronImpactPreview();
+}
+
+function updateCronScheduleMode() {
+  const mode = document.querySelector('input[name="cron-schedule-mode"]:checked')?.value || 'interval';
+  const intervalPanel = $('#cron-interval')?.closest('label');
+  const cronPanel = $('#cron-expression-panel');
+  const nightPanel = $('#cron-night-pause')?.closest('.cron-night-pause');
+  if (intervalPanel) intervalPanel.hidden = mode !== 'interval';
+  if (cronPanel) cronPanel.hidden = mode !== 'cron';
+  if (nightPanel) nightPanel.hidden = mode !== 'interval';
+  updateCronImpactPreview();
+}
+
+async function previewCronSchedule() {
+  const input = $('#cron-expression');
+  const output = $('#cron-expression-preview');
+  if (!input || !output) return;
+  const expression = input.value.trim();
+  if (!expression) {
+    output.className = 'cron-expression-preview error';
+    output.innerHTML = '<strong>Espressione mancante</strong><span>Inserisci cinque campi cron.</span>';
+    return;
+  }
+  output.className = 'cron-expression-preview loading';
+  output.innerHTML = '<strong>Verifica pianificazione…</strong>';
+  try {
+    const preview = await request(`/api/cron/preview?expression=${encodeURIComponent(expression)}&timeZone=Europe%2FRome`);
+    output.className = 'cron-expression-preview success';
+    output.innerHTML = `<strong>${escapeHtml(preview.description)}</strong><span>Prossimi avvii: ${preview.nextRuns.map(displayDateTime).map(escapeHtml).join(' · ')}</span>`;
+  } catch (error) {
+    output.className = 'cron-expression-preview error';
+    output.innerHTML = `<strong>Espressione non valida</strong><span>${escapeHtml(error.message)}</span>`;
+  }
+}
+
+async function loadCronPresets() {
+  const container = $('#cron-preset-list');
+  if (!container || container.dataset.loaded === 'true') return;
+  try {
+    const data = await request('/api/cron/presets');
+    container.innerHTML = data.presets.map((preset) => `<button type="button" class="cron-preset-chip" data-cron-preset="${escapeHtml(preset.id)}" data-cron-expression="${escapeHtml(preset.expression)}">${escapeHtml(preset.label)}</button>`).join('');
+    container.dataset.loaded = 'true';
+  } catch (error) {
+    container.innerHTML = `<span class="cron-inline-error">Preset non disponibili: ${escapeHtml(error.message)}</span>`;
+  }
+}
 
 async function loadCronStatus() {
   try {
@@ -1524,7 +1621,9 @@ function renderCronStatus(status) {
   if (!status) return;
 
   const enabledInput = $('#cron-enabled');
+  const modeInputs = [...document.querySelectorAll('input[name="cron-schedule-mode"]')];
   const intervalSelect = $('#cron-interval');
+  const expressionInput = $('#cron-expression');
   const batchSizeInput = $('#cron-batch-size');
   const minCheckIntervalSelect = $('#cron-min-check-interval');
   const nightPauseCheckbox = $('#cron-night-pause');
@@ -1533,16 +1632,25 @@ function renderCronStatus(status) {
   const hoursRow = $('#cron-hours-row');
 
   const activeEl = document.activeElement;
-  const isEditingForm = [enabledInput, intervalSelect, batchSizeInput, minCheckIntervalSelect, nightPauseCheckbox, startHourInput, endHourInput].includes(activeEl);
+  const tierInputs = [...document.querySelectorAll('[data-cron-tier-interval]')];
+  const isEditingForm = dirtySettingsSections.has('automation')
+    || [enabledInput, ...modeInputs, intervalSelect, expressionInput, batchSizeInput, minCheckIntervalSelect, nightPauseCheckbox, startHourInput, endHourInput, ...tierInputs].includes(activeEl)
+    || Boolean(activeEl?.closest?.('.cron-priority-panel, .cron-expression-panel'));
 
   if (!isEditingForm) {
     if (enabledInput) enabledInput.checked = Boolean(status.enabled);
+    const activeMode = status.scheduleMode === 'cron' ? 'cron' : 'interval';
+    modeInputs.forEach((input) => { input.checked = input.value === activeMode; });
     if (intervalSelect) intervalSelect.value = String(status.intervalMinutes || 60);
+    if (expressionInput) expressionInput.value = status.cronExpression || '0 8-19 * * 1-5';
     if (batchSizeInput) batchSizeInput.value = String(status.batchSize || 25);
     if (minCheckIntervalSelect) minCheckIntervalSelect.value = String(status.minCheckIntervalHours || 2);
     if (nightPauseCheckbox) nightPauseCheckbox.checked = Boolean(status.nightPause);
     if (startHourInput) startHourInput.value = String(status.startHour ?? 8);
     if (endHourInput) endHourInput.value = String(status.endHour ?? 20);
+    tierInputs.forEach((input) => { input.value = String(status.tierMinIntervalHours?.[input.dataset.cronTierInterval] || ({ high: 1, medium: 4, low: 8 })[input.dataset.cronTierInterval]); });
+    renderCronPriorityMatrix(status.statePriorities);
+    updateCronScheduleMode();
     if (hoursRow) hoursRow.style.opacity = status.nightPause ? '1' : '0.4';
   }
 
@@ -1565,7 +1673,9 @@ function renderCronStatus(status) {
       headerBadge.style.background = '';
       headerBadge.style.color = '';
       headerBadge.style.borderColor = '';
-      headerBadge.textContent = `Pianificato · ogni ${status.intervalMinutes} min`;
+      headerBadge.textContent = status.scheduleMode === 'cron'
+        ? 'Pianificato · orari specifici'
+        : `Pianificato · ogni ${status.intervalMinutes} min`;
     } else {
       headerBadge.className = 'badge';
       headerBadge.style.background = '';
@@ -1686,6 +1796,65 @@ function setupCronSection() {
   const stopBtn = $('#cron-stop-btn');
   const msg = $('#cron-save-message');
 
+  void loadCronPresets();
+  renderCronPriorityMatrix();
+
+  document.querySelectorAll('input[name="cron-schedule-mode"]').forEach((input) => input.addEventListener('change', () => {
+    updateCronScheduleMode();
+    markSettingsDirty('automation');
+    if (input.checked && input.value === 'cron') void previewCronSchedule();
+  }));
+
+  $('#cron-expression')?.addEventListener('input', () => {
+    clearTimeout(cronPreviewTimer);
+    cronPreviewTimer = setTimeout(previewCronSchedule, 350);
+    markSettingsDirty('automation');
+  });
+
+  $('#cron-preset-list')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-cron-expression]');
+    if (!button) return;
+    $('#cron-expression').value = button.dataset.cronExpression;
+    $('#cron-preset').value = button.dataset.cronPreset || '';
+    document.querySelectorAll('.cron-preset-chip').forEach((chip) => chip.classList.toggle('active', chip === button));
+    markSettingsDirty('automation');
+    void previewCronSchedule();
+  });
+
+  $('#cron-priority-matrix')?.addEventListener('click', (event) => {
+    const chip = event.target.closest('[data-cron-status]');
+    if (!chip || chip.classList.contains('is-locked')) return;
+    const currentTier = cronStatePriorities[chip.dataset.cronStatus] || 'medium';
+    moveCronPriorityStatus(chip.dataset.cronStatus, CRON_TIER_ORDER[(CRON_TIER_ORDER.indexOf(currentTier) + 1) % CRON_TIER_ORDER.length]);
+  });
+
+  $('#cron-priority-matrix')?.addEventListener('dragstart', (event) => {
+    const chip = event.target.closest('[data-cron-status]:not(.is-locked)');
+    if (!chip) return;
+    event.dataTransfer.setData('text/plain', chip.dataset.cronStatus);
+    event.dataTransfer.effectAllowed = 'move';
+    $('#cron-priority-matrix').classList.add('is-dragging');
+  });
+  $('#cron-priority-matrix')?.addEventListener('dragend', () => {
+    $('#cron-priority-matrix')?.classList.remove('is-dragging');
+    document.querySelectorAll('.cron-tier-card.drag-over').forEach((card) => card.classList.remove('drag-over'));
+  });
+  document.querySelectorAll('.cron-tier-card').forEach((card) => {
+    card.addEventListener('dragover', (event) => { event.preventDefault(); card.classList.add('drag-over'); });
+    card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+    card.addEventListener('drop', (event) => {
+      event.preventDefault();
+      card.classList.remove('drag-over');
+      moveCronPriorityStatus(event.dataTransfer.getData('text/plain'), card.dataset.cronTier);
+    });
+  });
+  $('#cron-reset-priorities')?.addEventListener('click', () => {
+    renderCronPriorityMatrix(CRON_PRIORITY_DEFAULTS);
+    document.querySelectorAll('[data-cron-tier-interval]').forEach((input) => { input.value = ({ high: 1, medium: 4, low: 8 })[input.dataset.cronTierInterval]; });
+    markSettingsDirty('automation');
+    updateCronImpactPreview();
+  });
+
   nightPauseCheckbox?.addEventListener('change', () => {
     if (hoursRow) hoursRow.style.opacity = nightPauseCheckbox.checked ? '1' : '0.4';
   });
@@ -1698,12 +1867,22 @@ function setupCronSection() {
     try {
       const payload = {
         enabled: $('#cron-enabled')?.checked,
+        scheduleMode: document.querySelector('input[name="cron-schedule-mode"]:checked')?.value || 'interval',
         intervalMinutes: Number($('#cron-interval')?.value) || 60,
+        cronExpression: $('#cron-expression')?.value?.trim() || '0 8-19 * * 1-5',
+        cronPreset: $('#cron-preset')?.value || '',
+        timeZone: 'Europe/Rome',
         batchSize: Number($('#cron-batch-size')?.value) || 25,
         minCheckIntervalHours: Number($('#cron-min-check-interval')?.value) || 2,
         nightPause: $('#cron-night-pause')?.checked,
-        startHour: Number($('#cron-start-hour')?.value) || 8,
-        endHour: Number($('#cron-end-hour')?.value) || 20,
+        startHour: Number($('#cron-start-hour')?.value ?? 8),
+        endHour: Number($('#cron-end-hour')?.value ?? 20),
+        statePriorities: cronStatePriorities,
+        tierMinIntervalHours: {
+          high: Number(document.querySelector('[data-cron-tier-interval="high"]')?.value) || 1,
+          medium: Number(document.querySelector('[data-cron-tier-interval="medium"]')?.value) || 4,
+          low: Number(document.querySelector('[data-cron-tier-interval="low"]')?.value) || 8,
+        },
       };
 
       const res = await request('/api/cron/config', {
@@ -1934,12 +2113,16 @@ function updateCronImpactPreview() {
   const preview = $('#cron-impact-preview');
   if (!preview) return;
   const enabled = Boolean($('#cron-enabled')?.checked);
+  const scheduleMode = document.querySelector('input[name="cron-schedule-mode"]:checked')?.value || 'interval';
   const interval = $('#cron-interval')?.selectedOptions?.[0]?.textContent || 'intervallo selezionato';
+  const cronExpression = $('#cron-expression')?.value?.trim() || 'espressione non definita';
   const batch = Number($('#cron-batch-size')?.value) || 25;
-  const minInterval = $('#cron-min-check-interval')?.selectedOptions?.[0]?.textContent || '';
   const nightPause = Boolean($('#cron-night-pause')?.checked);
+  const highCount = Object.values(cronStatePriorities).filter((tier) => tier === 'high').length;
+  const mediumCount = Object.values(cronStatePriorities).filter((tier) => tier === 'medium').length;
+  const lowCount = Object.values(cronStatePriorities).filter((tier) => tier === 'low').length;
   preview.innerHTML = enabled
-    ? `<strong>Impatto previsto</strong><span>${escapeHtml(interval)} · massimo ${batch} spedizioni per ciclo · ${escapeHtml(minInterval.toLocaleLowerCase('it-IT'))}${nightPause ? ' · pausa notturna attiva' : ''}.</span>`
+    ? `<strong>Impatto previsto</strong><span>${scheduleMode === 'cron' ? `Cron ${escapeHtml(cronExpression)} · fuso Europe/Rome` : escapeHtml(interval)} · massimo ${batch} spedizioni per ciclo${scheduleMode === 'interval' && nightPause ? ' · pausa notturna attiva' : ''}. Priorità: ${highCount} alte, ${mediumCount} medie, ${lowCount} basse.</span>`
     : '<strong>Automazione disattivata</strong><span>Le verifiche partiranno solo manualmente finché non salvi il servizio come attivo.</span>';
 }
 
@@ -2167,12 +2350,49 @@ function setupWorkspace() {
     const cronForm = $('#cron-config-form');
     const scheduleTitle = document.createElement('div');
     scheduleTitle.className = 'cron-panel-heading';
-    scheduleTitle.innerHTML = '<h3>Pianificazione</h3><p>Definisci frequenza, volume e fascia oraria dei controlli.</p>';
+    scheduleTitle.innerHTML = '<h3>Pianificazione</h3><p>Scegli un intervallo semplice oppure orari precisi nel fuso Europe/Rome.</p>';
     cronForm?.prepend(scheduleTitle);
+    const cronFields = cronForm?.querySelector('.cron-fields');
+    const intervalLabel = $('#cron-interval')?.closest('label');
+    const legacyMinIntervalLabel = $('#cron-min-check-interval')?.closest('label');
+    if (intervalLabel) intervalLabel.classList.add('cron-interval-field');
+    if (legacyMinIntervalLabel) legacyMinIntervalLabel.hidden = true;
+    scheduleTitle.insertAdjacentHTML('afterend', `
+      <div class="cron-mode-selector" role="radiogroup" aria-label="Modalità di pianificazione">
+        <label><input type="radio" name="cron-schedule-mode" value="interval" checked><span><strong>Intervallo periodico</strong><small>Ogni numero definito di minuti</small></span></label>
+        <label><input type="radio" name="cron-schedule-mode" value="cron"><span><strong>Orari specifici</strong><small>Calendario cron in ora italiana</small></span></label>
+      </div>
+    `);
+    const expressionPanel = document.createElement('section');
+    expressionPanel.id = 'cron-expression-panel';
+    expressionPanel.className = 'cron-expression-panel';
+    expressionPanel.hidden = true;
+    expressionPanel.innerHTML = `
+      <div class="cron-subheading"><div><strong>Calendario cron</strong><span>5 campi: minuto, ora, giorno, mese, giorno settimana</span></div><span class="cron-timezone">Europe/Rome</span></div>
+      <input id="cron-preset" type="hidden" value="">
+      <div id="cron-preset-list" class="cron-preset-list" aria-label="Pianificazioni rapide"><span class="cron-preset-loading">Caricamento preset…</span></div>
+      <label class="cron-expression-field">Espressione cron<input id="cron-expression" type="text" value="0 8-19 * * 1-5" spellcheck="false" autocomplete="off" placeholder="0 8-19 * * 1-5"></label>
+      <div id="cron-expression-preview" class="cron-expression-preview"><strong>Feriali, ogni ora dalle 08:00 alle 19:00</strong><span>L’anteprima mostrerà qui i prossimi cinque avvii.</span></div>
+    `;
+    intervalLabel?.insertAdjacentElement('afterend', expressionPanel);
+
+    const priorityPanel = document.createElement('section');
+    priorityPanel.className = 'cron-priority-panel';
+    priorityPanel.innerHTML = `
+      <div class="cron-priority-heading"><div><strong>Priorità per stato Raben</strong><span>Le fasce determinano ordine e frequenza dei ricontrolli.</span></div><button id="cron-reset-priorities" type="button" class="secondary">Ripristina consigliate</button></div>
+      <div id="cron-priority-matrix" class="cron-priority-matrix">
+        <section class="cron-tier-card tier-high" data-cron-tier="high"><header><div><strong>Alta priorità</strong><span>Urgenze operative</span></div><b data-cron-tier-count="high">0</b></header><label>Ricontrolla dopo <span><input type="number" min="0.5" max="72" step="0.5" value="1" data-cron-tier-interval="high"> ore</span></label><div class="cron-tier-states" data-cron-tier-states="high"></div></section>
+        <section class="cron-tier-card tier-medium" data-cron-tier="medium"><header><div><strong>Priorità media</strong><span>Spedizioni in movimento</span></div><b data-cron-tier-count="medium">0</b></header><label>Ricontrolla dopo <span><input type="number" min="0.5" max="168" step="0.5" value="4" data-cron-tier-interval="medium"> ore</span></label><div class="cron-tier-states" data-cron-tier-states="medium"></div></section>
+        <section class="cron-tier-card tier-low" data-cron-tier="low"><header><div><strong>Priorità bassa</strong><span>Stati stabili o tecnici</span></div><b data-cron-tier-count="low">0</b></header><label>Ricontrolla dopo <span><input type="number" min="0.5" max="336" step="0.5" value="8" data-cron-tier-interval="low"> ore</span></label><div class="cron-tier-states" data-cron-tier-states="low"></div></section>
+        <section class="cron-tier-card tier-excluded" data-cron-tier="excluded"><header><div><strong>Escluse</strong><span>Nessun ricontrollo cron</span></div><b data-cron-tier-count="excluded">0</b></header><p>Gli stati finali Raben restano sempre esclusi.</p><div class="cron-tier-states" data-cron-tier-states="excluded"></div></section>
+      </div>
+      <p class="cron-priority-help">Trascina gli stati tra le fasce oppure cliccali per spostarli. Gli stati finali sono bloccati.</p>
+    `;
+    cronFields?.insertAdjacentElement('afterend', priorityPanel);
     const impactPreview = document.createElement('div');
     impactPreview.id = 'cron-impact-preview';
     impactPreview.className = 'cron-impact-preview';
-    cronForm?.querySelector('.cron-fields')?.insertAdjacentElement('afterend', impactPreview);
+    priorityPanel.insertAdjacentElement('afterend', impactPreview);
   }
 
   if (rabenBetaCard && importCard) {
