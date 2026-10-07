@@ -42,6 +42,11 @@ let prestaShopCarrierCatalog = null;
 let activeReportFilter = 'all';
 let reportSearchQuery = '';
 let activeControlRabenJobId = '';
+let globalSearchAbortController = null;
+let globalSearchDebounceTimer = null;
+let globalSearchResults = [];
+let globalSearchActiveIndex = -1;
+let controlRefreshAbortController = null;
 const CONTROL_Raben_JOB_STORAGE_KEY = 'raben-active-verification';
 
 async function request(url, options) {
@@ -650,7 +655,7 @@ function renderControlMappingAlert(counts = {}) {
 
 function updateControlFilterUi() {
   const hasFilters = Boolean(
-    ($('#control-search-query')?.value || '').trim()
+    ($('#control-search-query')?.value || $('#global-tracking-query')?.value || '').trim()
     || $('#control-raben-filter')?.value
     || controlPrestaStateFilter
     || $('#control-date-filter')?.value
@@ -770,6 +775,7 @@ function renderControlCheckSort() {
 
 function renderControlCenter(data) {
   controlOverview = data;
+  const searchQuery = ($('#control-search-query')?.value || $('#global-tracking-query')?.value || '').trim();
   rabenStateMappings = data.stateMappings || rabenStateMappings;
   controlRecords = data.records || [];
   const batchMode = Boolean(activeBatchFilter?.trackings);
@@ -834,7 +840,18 @@ function renderControlCenter(data) {
     backupBadge.textContent = `${data.total} spedizioni pronte`;
   }
   const isArchivedActive = $('#control-raben-filter')?.value === 'Archiviate';
-  const emptyMessage = isArchivedActive ? 'Nessuna spedizione archiviata.' : data.total ? 'Nessuna spedizione corrisponde ai filtri.' : 'Nessuna spedizione ancora archiviata. Verifica un file per popolare il centro.';
+  const emptyMessage = searchQuery
+    ? `Nessuna spedizione trovata per “${escapeHtml(searchQuery)}”. Controlla il codice oppure rimuovi gli altri filtri.`
+    : isArchivedActive ? 'Nessuna spedizione archiviata.' : data.total ? 'Nessuna spedizione corrisponde ai filtri.' : 'Nessuna spedizione ancora archiviata. Verifica un file per popolare il centro.';
+  const searchSummary = $('#control-search-summary');
+  if (searchSummary) {
+    searchSummary.hidden = !searchQuery;
+    searchSummary.innerHTML = searchQuery
+      ? `<span><strong>${filteredTotal}</strong> ${filteredTotal === 1 ? 'spedizione trovata' : 'spedizioni trovate'} per “${escapeHtml(searchQuery)}”${filteredTotal === 0 ? ' con i filtri attuali' : ''}</span><button type="button" class="secondary" data-clear-control-search>Rimuovi ricerca</button>`
+      : '';
+  }
+  const searchLive = $('#global-search-live');
+  if (searchLive && searchQuery) searchLive.textContent = `${filteredTotal} ${filteredTotal === 1 ? 'spedizione trovata' : 'spedizioni trovate'} nella tabella.`;
   const visibleTrackings = new Set(pageRecords.map((row) => row.trackingNumber));
   controlSelectedTrackingNumbers = new Set([...controlSelectedTrackingNumbers].filter((trackingNumber) => visibleTrackings.has(trackingNumber)));
   $('#control-table tbody').innerHTML = pageRecords.length ? pageRecords.map((row) => {
@@ -847,7 +864,10 @@ function renderControlCenter(data) {
       : prestaShopBadge(row.currentState);
     const isSelected = controlSelectedTrackingNumbers.has(row.trackingNumber);
     const rowClasses = [row.trackingNumber === activeControlTrackingNumber ? 'active' : '', isSelected ? 'is-selected' : ''].filter(Boolean).join(' ');
-    return `<tr data-tracking="${escapeHtml(row.trackingNumber)}" class="${rowClasses}"><td class="control-select-cell"><label class="control-select-target" title="Seleziona ${escapeHtml(row.trackingNumber)}"><input class="control-row-select row-select" data-tracking="${escapeHtml(row.trackingNumber)}" type="checkbox" ${isSelected ? 'checked' : ''} aria-label="Seleziona spedizione ${escapeHtml(row.trackingNumber)}"><span class="sr-only">Seleziona spedizione ${escapeHtml(row.trackingNumber)}</span></label></td><td>${copyableValue(row.trackingNumber, 'Numero spedizione', 'tracking-val')}</td><td>${copyableValue(row.orderReference, 'Riferimento ordine', 'order-val')}</td><td><div class="raben-state-cell">${rabenBadge(row.rabenStatus)}${archivedTag}<small title="Data e ora dichiarate da Raben">${displayRabenEventDate(row)}</small></div></td><td>${prestaCell}</td><td><div class="control-alignment-cell">${prestaShopStateAction(row)}</div></td><td><div class="control-check-cell"><span>${displayDateTime(checkedAt)}</span>${checkedAge ? `<small>${escapeHtml(checkedAge)}</small>` : ''}</div></td><td><button class="open-shipment secondary" data-tracking="${escapeHtml(row.trackingNumber)}" aria-label="Apri dettaglio della spedizione ${escapeHtml(row.trackingNumber)}"><span class="sr-only">Dettaglio</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg></button></td></tr>`;
+    const matchHint = searchQuery && row.searchMatch
+      ? `<small class="control-search-match">${escapeHtml(row.searchMatch.label)}: ${escapeHtml(row.searchMatch.value)}</small>`
+      : '';
+    return `<tr data-tracking="${escapeHtml(row.trackingNumber)}" class="${rowClasses}"><td class="control-select-cell"><label class="control-select-target" title="Seleziona ${escapeHtml(row.trackingNumber)}"><input class="control-row-select row-select" data-tracking="${escapeHtml(row.trackingNumber)}" type="checkbox" ${isSelected ? 'checked' : ''} aria-label="Seleziona spedizione ${escapeHtml(row.trackingNumber)}"><span class="sr-only">Seleziona spedizione ${escapeHtml(row.trackingNumber)}</span></label></td><td><div class="control-search-primary">${copyableValue(row.trackingNumber, 'Numero spedizione', 'tracking-val')}${matchHint}</div></td><td>${copyableValue(row.orderReference, 'Riferimento ordine', 'order-val')}</td><td><div class="raben-state-cell">${rabenBadge(row.rabenStatus)}${archivedTag}<small title="Data e ora dichiarate da Raben">${displayRabenEventDate(row)}</small></div></td><td>${prestaCell}</td><td><div class="control-alignment-cell">${prestaShopStateAction(row)}</div></td><td><div class="control-check-cell"><span>${displayDateTime(checkedAt)}</span>${checkedAge ? `<small>${escapeHtml(checkedAge)}</small>` : ''}</div></td><td><button class="open-shipment secondary" data-tracking="${escapeHtml(row.trackingNumber)}" aria-label="Apri dettaglio della spedizione ${escapeHtml(row.trackingNumber)}"><span class="sr-only">Dettaglio</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg></button></td></tr>`;
   }).join('') : `<tr><td colspan="8" class="control-empty">${emptyMessage}</td></tr>`;
   updateControlSelectionUi(pageRecords);
   renderControlPager(filteredTotal, totalPages);
@@ -1350,6 +1370,8 @@ function exportVerificationReportCsv() {
 }
 
 async function refreshControlCenter() {
+  controlRefreshAbortController?.abort();
+  controlRefreshAbortController = new AbortController();
   const params = new URLSearchParams();
   const query = ($('#control-search-query')?.value || $('#global-tracking-query')?.value || '').trim();
   if (query) params.set('query', query);
@@ -1364,12 +1386,16 @@ async function refreshControlCenter() {
   params.set('page', activeBatchFilter ? '1' : String(controlPage));
   params.set('pageSize', activeBatchFilter ? '500' : String(CONTROL_PAGE_SIZE));
   try {
-    renderControlCenter(await request(`/api/control-center?${params}`));
+    renderControlCenter(await request(`/api/control-center?${params}`, { signal: controlRefreshAbortController.signal }));
     const timeStr = new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
     const isAsc = controlCheckSort === 'asc';
     $('#control-last-sync').innerHTML = `Elenco aggiornato alle ${timeStr} · <span class="control-sync-sort-info ${isAsc ? 'asc' : 'desc'}">${isAsc ? '↑ Meno recenti prima' : '↓ Più recenti prima'}</span>`;
   }
-  catch (e) { $('#control-table tbody').innerHTML = `<tr><td colspan="8" class="control-empty">${escapeHtml(e.message)}</td></tr>`; }
+  catch (e) {
+    if (e.name === 'AbortError') return;
+    $('#control-table tbody').innerHTML = `<tr><td colspan="8" class="control-empty">${escapeHtml(e.message)} <button id="control-refresh-retry" type="button" class="secondary">Riprova</button></td></tr>`;
+    $('#control-refresh-retry')?.addEventListener('click', () => void refreshControlCenter());
+  }
 }
 
 function setupBackupRestore() {
@@ -1617,6 +1643,32 @@ async function loadCronStatus() {
   }
 }
 
+async function loadCronOperationLog() {
+  const list = $('#cron-operation-log');
+  const count = $('#cron-operation-count');
+  if (!list) return;
+  list.setAttribute('aria-busy', 'true');
+  try {
+    const data = await request('/api/cron/log?limit=20');
+    if (count) count.textContent = String(data.total || 0);
+    if (!data.operations?.length) {
+      list.innerHTML = '<li class="cron-log-empty">Nessuna operazione cron ancora registrata.</li>';
+      return;
+    }
+    list.innerHTML = data.operations.map((operation) => `
+      <li class="cron-log-entry ${escapeHtml(operation.level || 'info')}">
+        <span class="cron-log-marker" aria-hidden="true"></span>
+        <div><strong>${escapeHtml(operation.action || 'Operazione cron')}</strong><span>${escapeHtml(operation.detail || 'Nessun dettaglio')}</span></div>
+        <time datetime="${escapeHtml(operation.at || '')}">${displayDateTime(operation.at)}</time>
+      </li>
+    `).join('');
+  } catch (error) {
+    list.innerHTML = `<li class="cron-log-empty error">Impossibile caricare il registro: ${escapeHtml(error.message)}</li>`;
+  } finally {
+    list.removeAttribute('aria-busy');
+  }
+}
+
 function renderCronStatus(status) {
   if (!status) return;
 
@@ -1646,8 +1698,8 @@ function renderCronStatus(status) {
     if (batchSizeInput) batchSizeInput.value = String(status.batchSize || 25);
     if (minCheckIntervalSelect) minCheckIntervalSelect.value = String(status.minCheckIntervalHours || 2);
     if (nightPauseCheckbox) nightPauseCheckbox.checked = Boolean(status.nightPause);
-    if (startHourInput) startHourInput.value = String(status.startHour ?? 8);
-    if (endHourInput) endHourInput.value = String(status.endHour ?? 20);
+    if (startHourInput) startHourInput.value = String(status.pauseStartHour ?? 20);
+    if (endHourInput) endHourInput.value = String(status.pauseEndHour ?? 8);
     tierInputs.forEach((input) => { input.value = String(status.tierMinIntervalHours?.[input.dataset.cronTierInterval] || ({ high: 1, medium: 4, low: 8 })[input.dataset.cronTierInterval]); });
     renderCronPriorityMatrix(status.statePriorities);
     updateCronScheduleMode();
@@ -1667,7 +1719,7 @@ function renderCronStatus(status) {
       headerBadge.style.background = '#fef3c7';
       headerBadge.style.color = '#b45309';
       headerBadge.style.borderColor = '#fde68a';
-      headerBadge.textContent = `In pausa · ${status.startHour}:00–${status.endHour}:00`;
+      headerBadge.textContent = `In pausa · ${status.pauseStartHour ?? 20}:00–${status.pauseEndHour ?? 8}:00`;
     } else if (status.enabled) {
       headerBadge.className = 'badge info';
       headerBadge.style.background = '';
@@ -1752,6 +1804,7 @@ function renderCronStatus(status) {
     if (cronLastIsRunning && !status.isRunning) {
       showFloatingToast('Controllo periodico completato con successo!', 'success');
       void refreshControlCenter();
+      void loadCronOperationLog();
     }
   }
 
@@ -1796,7 +1849,20 @@ function setupCronSection() {
   const stopBtn = $('#cron-stop-btn');
   const msg = $('#cron-save-message');
 
+  const pauseStartLabel = $('#cron-start-hour')?.closest('label');
+  const pauseEndLabel = $('#cron-end-hour')?.closest('label');
+  const pauseHint = hoursRow?.nextElementSibling;
+  if ($('#cron-start-hour')) $('#cron-start-hour').value = '20';
+  if ($('#cron-end-hour')) $('#cron-end-hour').value = '8';
+  if (pauseStartLabel?.firstChild) pauseStartLabel.firstChild.textContent = 'Pausa dalle';
+  if (pauseEndLabel?.firstChild) pauseEndLabel.firstChild.textContent = 'Riprendi alle';
+  if (pauseHint?.classList.contains('field-hint')) {
+    pauseHint.textContent = 'In questa fascia (ad esempio 20:00–08:00) il controllo automatico resta fermo. L’avvio manuale rimane disponibile.';
+  }
+
   void loadCronPresets();
+  void loadCronOperationLog();
+  $('#cron-log-refresh')?.addEventListener('click', () => void loadCronOperationLog());
   renderCronPriorityMatrix();
 
   document.querySelectorAll('input[name="cron-schedule-mode"]').forEach((input) => input.addEventListener('change', () => {
@@ -1875,8 +1941,8 @@ function setupCronSection() {
         batchSize: Number($('#cron-batch-size')?.value) || 25,
         minCheckIntervalHours: Number($('#cron-min-check-interval')?.value) || 2,
         nightPause: $('#cron-night-pause')?.checked,
-        startHour: Number($('#cron-start-hour')?.value ?? 8),
-        endHour: Number($('#cron-end-hour')?.value ?? 20),
+        pauseStartHour: Number($('#cron-start-hour')?.value ?? 20),
+        pauseEndHour: Number($('#cron-end-hour')?.value ?? 8),
         statePriorities: cronStatePriorities,
         tierMinIntervalHours: {
           high: Number(document.querySelector('[data-cron-tier-interval="high"]')?.value) || 1,
@@ -1897,6 +1963,7 @@ function setupCronSection() {
       }
       showFloatingToast('Configurazione cron salvata!', 'success');
       renderCronStatus(res.status);
+      void loadCronOperationLog();
       markSettingsClean('automation');
       updateSettingsHealth();
     } catch (err) {
@@ -1915,6 +1982,7 @@ function setupCronSection() {
       const res = await request('/api/cron/trigger', { method: 'POST' });
       showFloatingToast('Controllo manuale avviato in background!', 'success');
       renderCronStatus(res.status);
+      void loadCronOperationLog();
       if (!cronPollingTimer) {
         cronPollingTimer = setInterval(loadCronStatus, 2000);
       }
@@ -1930,6 +1998,7 @@ function setupCronSection() {
       const res = await request('/api/cron/stop', { method: 'POST' });
       showFloatingToast(res.message || 'Richiesta di arresto inviata.', 'warning');
       renderCronStatus(res.status);
+      void loadCronOperationLog();
     } catch (err) {
       alert(`Errore: ${err.message}`);
     } finally {
@@ -2118,12 +2187,128 @@ function updateCronImpactPreview() {
   const cronExpression = $('#cron-expression')?.value?.trim() || 'espressione non definita';
   const batch = Number($('#cron-batch-size')?.value) || 25;
   const nightPause = Boolean($('#cron-night-pause')?.checked);
+  const pauseStart = Number($('#cron-start-hour')?.value ?? 20);
+  const pauseEnd = Number($('#cron-end-hour')?.value ?? 8);
   const highCount = Object.values(cronStatePriorities).filter((tier) => tier === 'high').length;
   const mediumCount = Object.values(cronStatePriorities).filter((tier) => tier === 'medium').length;
   const lowCount = Object.values(cronStatePriorities).filter((tier) => tier === 'low').length;
   preview.innerHTML = enabled
-    ? `<strong>Impatto previsto</strong><span>${scheduleMode === 'cron' ? `Cron ${escapeHtml(cronExpression)} · fuso Europe/Rome` : escapeHtml(interval)} · massimo ${batch} spedizioni per ciclo${scheduleMode === 'interval' && nightPause ? ' · pausa notturna attiva' : ''}. Priorità: ${highCount} alte, ${mediumCount} medie, ${lowCount} basse.</span>`
+    ? `<strong>Impatto previsto</strong><span>${scheduleMode === 'cron' ? `Cron ${escapeHtml(cronExpression)} · fuso Europe/Rome` : escapeHtml(interval)} · massimo ${batch} spedizioni per ciclo${scheduleMode === 'interval' && nightPause ? ` · pausa ${pauseStart}:00–${pauseEnd}:00` : ''}. Priorità: ${highCount} alte, ${mediumCount} medie, ${lowCount} basse.</span>`
     : '<strong>Automazione disattivata</strong><span>Le verifiche partiranno solo manualmente finché non salvi il servizio come attivo.</span>';
+}
+
+function emphasizeSearchMatch(value, query) {
+  const text = String(value || '');
+  const needle = String(query || '').trim();
+  if (!needle) return escapeHtml(text);
+  const index = text.toLocaleLowerCase('it-IT').indexOf(needle.toLocaleLowerCase('it-IT'));
+  if (index < 0) return escapeHtml(text);
+  return `${escapeHtml(text.slice(0, index))}<mark>${escapeHtml(text.slice(index, index + needle.length))}</mark>${escapeHtml(text.slice(index + needle.length))}`;
+}
+
+function closeGlobalSearch() {
+  const panel = $('#global-search-suggestions');
+  const input = $('#global-tracking-query');
+  if (panel) panel.hidden = true;
+  if (input) {
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+  }
+  globalSearchActiveIndex = -1;
+}
+
+function updateGlobalSearchClearButton() {
+  const input = $('#global-tracking-query');
+  const clearButton = $('#global-search-clear');
+  if (clearButton) clearButton.hidden = !input?.value;
+}
+
+function setGlobalSearchActiveIndex(index) {
+  const options = [...document.querySelectorAll('#global-search-results [role="option"]')];
+  if (!options.length) return;
+  globalSearchActiveIndex = (index + options.length) % options.length;
+  options.forEach((option, optionIndex) => {
+    const active = optionIndex === globalSearchActiveIndex;
+    option.classList.toggle('active', active);
+    option.setAttribute('aria-selected', String(active));
+    if (active) {
+      $('#global-tracking-query')?.setAttribute('aria-activedescendant', option.id);
+      option.scrollIntoView({ block: 'nearest' });
+    }
+  });
+}
+
+function renderGlobalSearchSuggestions(data, query) {
+  const panel = $('#global-search-suggestions');
+  const resultsContainer = $('#global-search-results');
+  const input = $('#global-tracking-query');
+  if (!panel || !resultsContainer || !input || input.value.trim() !== query) return;
+  globalSearchResults = data.results || [];
+  globalSearchActiveIndex = -1;
+  panel.hidden = false;
+  input.setAttribute('aria-expanded', 'true');
+  input.removeAttribute('aria-activedescendant');
+  const live = $('#global-search-live');
+  if (live) live.textContent = globalSearchResults.length
+    ? `${globalSearchResults.length} suggerimenti disponibili.`
+    : 'Nessuna spedizione trovata.';
+
+  if (!globalSearchResults.length) {
+    resultsContainer.innerHTML = `<div class="global-search-empty"><strong>Nessuna spedizione trovata</strong><span>Controlla il codice oppure prova con riferimento, destinatario o città.</span></div>`;
+    return;
+  }
+
+  resultsContainer.innerHTML = globalSearchResults.map((result, index) => {
+    const secondary = [result.orderReference, result.recipient].filter(Boolean).join(' · ') || 'Nessun riferimento ordine';
+    const archived = result.archived ? '<span class="global-search-archived">Archiviata</span>' : '';
+    return `<button id="global-search-option-${index}" type="button" class="global-search-result" role="option" aria-selected="false" data-result-index="${index}">
+      <span class="global-search-result-main"><strong>${emphasizeSearchMatch(result.trackingNumber, query)}</strong>${archived}</span>
+      <span class="global-search-result-context">${escapeHtml(secondary)}</span>
+      <span class="global-search-result-match"><b>${escapeHtml(result.match?.label || 'Spedizione')}</b><span>${emphasizeSearchMatch(result.match?.value || '', query)}</span></span>
+      <span class="global-search-result-status">${escapeHtml(result.rabenStatus || 'Non verificato')}</span>
+    </button>`;
+  }).join('');
+}
+
+async function loadGlobalSearchSuggestions() {
+  const input = $('#global-tracking-query');
+  const panel = $('#global-search-suggestions');
+  const resultsContainer = $('#global-search-results');
+  const query = input?.value.trim() || '';
+  globalSearchAbortController?.abort();
+  globalSearchResults = [];
+  globalSearchActiveIndex = -1;
+  if (query.length < 2) {
+    globalSearchResults = [];
+    closeGlobalSearch();
+    return;
+  }
+
+  globalSearchAbortController = new AbortController();
+  if (panel && resultsContainer) {
+    panel.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    resultsContainer.innerHTML = '<div class="global-search-loading"><span aria-hidden="true"></span>Cerco nelle spedizioni…</div>';
+  }
+  try {
+    const data = await request(`/api/search/suggestions?query=${encodeURIComponent(query)}&limit=6`, { signal: globalSearchAbortController.signal });
+    renderGlobalSearchSuggestions(data, query);
+  } catch (error) {
+    if (error.name === 'AbortError') return;
+    if (resultsContainer) resultsContainer.innerHTML = `<div class="global-search-empty error"><strong>Ricerca non disponibile</strong><span>${escapeHtml(error.message)}. Riprova tra poco.</span></div>`;
+  }
+}
+
+function activateGlobalSearchResult(result) {
+  if (!result?.trackingNumber) return;
+  const input = $('#global-tracking-query');
+  if (input) input.value = result.trackingNumber;
+  updateGlobalSearchClearButton();
+  if ($('#control-search-query')) $('#control-search-query').value = result.trackingNumber;
+  closeGlobalSearch();
+  if (location.hash !== '#control') location.hash = 'control';
+  else showView('control');
+  requestAnimationFrame(() => void openShipmentDetail(result.trackingNumber));
 }
 
 function setupWorkspace() {
@@ -2393,6 +2578,14 @@ function setupWorkspace() {
     impactPreview.id = 'cron-impact-preview';
     impactPreview.className = 'cron-impact-preview';
     priorityPanel.insertAdjacentElement('afterend', impactPreview);
+
+    const summaryBox = cronCard.querySelector('.cron-summary-box');
+    summaryBox?.insertAdjacentHTML('afterend', `
+      <section class="cron-operation-panel" aria-labelledby="cron-operation-title">
+        <header><div><h4 id="cron-operation-title">Registro operazioni</h4><span>Ultimi eventi del controllo automatico</span></div><div><b id="cron-operation-count">0</b><button id="cron-log-refresh" type="button" class="secondary">Aggiorna</button></div></header>
+        <ol id="cron-operation-log" class="cron-operation-log" aria-live="polite"><li class="cron-log-empty">Caricamento registro…</li></ol>
+      </section>
+    `);
   }
 
   if (rabenBetaCard && importCard) {
@@ -2605,6 +2798,7 @@ function setupWorkspace() {
           <button type="button" class="audit-pill-btn active" data-type="">Tutti gli eventi</button>
           <button type="button" class="audit-pill-btn" data-type="importazione">📥 Importazioni</button>
           <button type="button" class="audit-pill-btn" data-type="raben">🚚 Scansioni Raben</button>
+          <button type="button" class="audit-pill-btn" data-type="cron">⏱ Cron</button>
           <button type="button" class="audit-pill-btn" data-type="prestashop">🔄 PrestaShop</button>
           <button type="button" class="audit-pill-btn" data-type="gestione">📦 Gestione & Note</button>
         </div>
@@ -2658,18 +2852,90 @@ function setupWorkspace() {
     history: '<svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7L4 8.6M4 4v4.6h4.6M12 8v5l3 2"/></svg>',
     settings: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7-.7-2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7 2-.7Z"/></svg>',
   };
-  document.body.insertAdjacentHTML('afterbegin', `<header class="app-topbar"><button id="mobile-navigation-toggle" class="topbar-icon" type="button" aria-label="Apri navigazione" aria-expanded="false"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><a class="topbar-brand" href="#control" aria-label="Raben - Tracking Center"><strong>RABEN</strong><span>Tracking Center</span></a><form id="global-tracking-form" class="global-tracking-search" role="search"><label class="sr-only" for="global-tracking-query">Cerca tracking o riferimento ordine</label><input id="global-tracking-query" type="search" placeholder="Cerca tracking, riferimento o ID ordine"><button type="submit">Cerca</button></form><div class="topbar-actions"><span class="topbar-live"><i aria-hidden="true"></i> Sistema locale</span><button id="topbar-help-btn" type="button" class="topbar-help" title="Guida e funzionamento dell'applicazione">? <span>Aiuto</span></button><span class="topbar-user"><span aria-hidden="true">OP</span><strong>Operazioni</strong></span></div></header>`);
+  document.body.insertAdjacentHTML('afterbegin', `<header class="app-topbar"><button id="mobile-navigation-toggle" class="topbar-icon" type="button" aria-label="Apri navigazione" aria-expanded="false"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><a class="topbar-brand" href="#control" aria-label="Raben - Tracking Center"><strong>RABEN</strong><span>Tracking Center</span></a><form id="global-tracking-form" class="global-tracking-search" role="search"><div class="global-search-field"><label class="sr-only" for="global-tracking-query">Cerca tracking o riferimento ordine</label><input id="global-tracking-query" type="search" placeholder="Cerca tracking, riferimento o ID ordine"><button id="global-search-clear" class="global-search-clear" type="button" aria-label="Cancella ricerca e chiudi i suggerimenti" title="Cancella ricerca" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg></button></div><button type="submit">Cerca</button></form><div class="topbar-actions"><span class="topbar-live"><i aria-hidden="true"></i> Sistema locale</span><button id="topbar-help-btn" type="button" class="topbar-help" title="Guida e funzionamento dell'applicazione">? <span>Aiuto</span></button><span class="topbar-user"><span aria-hidden="true">OP</span><strong>Operazioni</strong></span></div></header>`);
+  const globalSearchForm = $('#global-tracking-form');
+  const globalSearchInput = $('#global-tracking-query');
+  globalSearchInput.setAttribute('placeholder', 'Cerca spedizioni: tracking, ordine o destinatario');
+  globalSearchInput.setAttribute('autocomplete', 'off');
+  globalSearchInput.setAttribute('spellcheck', 'false');
+  globalSearchInput.setAttribute('maxlength', '160');
+  globalSearchInput.setAttribute('role', 'combobox');
+  globalSearchInput.setAttribute('aria-autocomplete', 'list');
+  globalSearchInput.setAttribute('aria-haspopup', 'listbox');
+  globalSearchInput.setAttribute('aria-controls', 'global-search-results');
+  globalSearchInput.setAttribute('aria-expanded', 'false');
+  globalSearchInput.setAttribute('aria-keyshortcuts', 'Control+K Meta+K');
+  globalSearchForm.insertAdjacentHTML('beforeend', '<section id="global-search-suggestions" class="global-search-suggestions" aria-label="Suggerimenti di ricerca" hidden><div class="global-search-heading"><strong>Spedizioni</strong><span>Frecce per selezionare · Invio per aprire · Esc per chiudere</span></div><div id="global-search-results" role="listbox"></div></section><span id="global-search-live" class="sr-only" role="status" aria-live="polite"></span>');
   main.insertAdjacentHTML('afterbegin', `<aside class="workspace-nav"><div class="nav-heading"><span>OPERAZIONI</span><button id="desktop-navigation-toggle" type="button" title="Comprimi navigazione" aria-label="Comprimi navigazione" aria-expanded="true"><svg viewBox="0 0 24 24"><path d="m14 7-5 5 5 5"/></svg></button></div><nav aria-label="Navigazione principale"><button data-view-link="control" title="Centro di controllo">${icons.control}<span>Centro di controllo</span></button><button data-view-link="import" title="Importa spedizioni">${icons.import}<span>Importa spedizioni</span></button><button data-view-link="history" title="Storico importazioni">${icons.history}<span>Storico importazioni</span></button><span class="nav-section">SISTEMA</span><button data-view-link="settings" title="Configurazione">${icons.settings}<span>Configurazione</span></button></nav><p class="nav-note">Dati operativi e note conservati localmente.</p></aside><button id="navigation-backdrop" class="navigation-backdrop" type="button" aria-label="Chiudi navigazione"></button>`);
   main.querySelectorAll('[data-view-link]').forEach((button) => button.addEventListener('click', () => { location.hash = button.dataset.viewLink; document.body.classList.remove('navigation-open'); $('#mobile-navigation-toggle').setAttribute('aria-expanded', 'false'); }));
   $('#desktop-navigation-toggle').addEventListener('click', () => { const collapsed = document.body.classList.toggle('sidebar-collapsed'); $('#desktop-navigation-toggle').setAttribute('aria-expanded', String(!collapsed)); $('#desktop-navigation-toggle').setAttribute('aria-label', collapsed ? 'Espandi navigazione' : 'Comprimi navigazione'); });
   $('#mobile-navigation-toggle').addEventListener('click', () => { const open = document.body.classList.toggle('navigation-open'); $('#mobile-navigation-toggle').setAttribute('aria-expanded', String(open)); });
   $('#navigation-backdrop').addEventListener('click', () => { document.body.classList.remove('navigation-open'); $('#mobile-navigation-toggle').setAttribute('aria-expanded', 'false'); });
-  $('#global-tracking-form').addEventListener('submit', (event) => { event.preventDefault(); controlPage = 1; location.hash = 'control'; refreshControlCenter(); });
-  $('#global-tracking-query')?.addEventListener('input', () => {
+  globalSearchForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const selected = globalSearchResults[globalSearchActiveIndex >= 0 ? globalSearchActiveIndex : 0];
+    if (!$('#global-search-suggestions')?.hidden && selected) {
+      activateGlobalSearchResult(selected);
+      return;
+    }
     controlPage = 1;
-    if ($('#control-search-query')) $('#control-search-query').value = $('#global-tracking-query').value;
+    location.hash = 'control';
+    closeGlobalSearch();
+    void refreshControlCenter();
+  });
+  globalSearchInput.addEventListener('input', () => {
+    controlPage = 1;
+    updateGlobalSearchClearButton();
+    if ($('#control-search-query')) $('#control-search-query').value = globalSearchInput.value;
+    globalSearchResults = [];
+    closeGlobalSearch();
     clearTimeout(window.controlSearchTimer);
+    clearTimeout(globalSearchDebounceTimer);
+    globalSearchDebounceTimer = setTimeout(loadGlobalSearchSuggestions, 180);
     window.controlSearchTimer = setTimeout(refreshControlCenter, 300);
+  });
+  $('#global-search-clear').addEventListener('click', () => {
+    globalSearchAbortController?.abort();
+    clearTimeout(globalSearchDebounceTimer);
+    clearTimeout(window.controlSearchTimer);
+    globalSearchInput.value = '';
+    if ($('#control-search-query')) $('#control-search-query').value = '';
+    globalSearchResults = [];
+    closeGlobalSearch();
+    updateGlobalSearchClearButton();
+    controlPage = 1;
+    void refreshControlCenter();
+    globalSearchInput.focus();
+  });
+  globalSearchInput.addEventListener('keydown', (event) => {
+    const panelOpen = !$('#global-search-suggestions')?.hidden;
+    if (event.key === 'ArrowDown' && panelOpen && globalSearchResults.length) {
+      event.preventDefault();
+      setGlobalSearchActiveIndex(globalSearchActiveIndex + 1);
+    } else if (event.key === 'ArrowUp' && panelOpen && globalSearchResults.length) {
+      event.preventDefault();
+      setGlobalSearchActiveIndex(globalSearchActiveIndex - 1);
+    } else if (event.key === 'Escape' && panelOpen) {
+      event.preventDefault();
+      closeGlobalSearch();
+    }
+  });
+  globalSearchInput.addEventListener('focus', () => { if (globalSearchInput.value.trim().length >= 2) void loadGlobalSearchSuggestions(); });
+  globalSearchForm.addEventListener('focusout', () => setTimeout(() => { if (!globalSearchForm.contains(document.activeElement)) closeGlobalSearch(); }, 0));
+  $('#global-search-results').addEventListener('click', (event) => {
+    const option = event.target.closest('[data-result-index]');
+    if (option) activateGlobalSearchResult(globalSearchResults[Number(option.dataset.resultIndex)]);
+  });
+  document.addEventListener('keydown', (event) => {
+    const targetIsEditable = event.target.matches('input, textarea, select, [contenteditable="true"]');
+    if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'k') {
+      event.preventDefault();
+      globalSearchInput.focus();
+      globalSearchInput.select();
+    } else if (event.key === '/' && !targetIsEditable && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      globalSearchInput.focus();
+    }
   });
   $('#refresh-history').addEventListener('click', renderImportHistory);
   $('#state-mapping-form').addEventListener('submit', saveStateMappings);
@@ -2731,6 +2997,7 @@ function setupControlWorkspace() {
   if (initialEmptyCell) initialEmptyCell.colSpan = card.querySelectorAll('#control-table thead th').length;
   card.querySelector('.control-heading > div').insertAdjacentHTML('beforeend', '<div class="control-meta"><span id="control-service-status" class="control-service-status" data-state="off">Raben tracking non attivo</span><span id="control-last-sync" class="control-last-sync" aria-live="polite"></span></div>');
   card.querySelector('.control-filters').insertAdjacentHTML('beforebegin', '<nav id="control-quick-filters" class="control-quick-filters" aria-label="Filtra per stato Raben"><span class="filter-bar-label">Stati Raben</span><button type="button" class="control-quick-filter active" data-raben-status=""><span>Tutte</span><strong>0</strong></button></nav>');
+  card.querySelector('.control-filters').insertAdjacentHTML('beforebegin', '<div id="control-search-summary" class="control-search-summary" role="status" aria-live="polite" hidden></div>');
   card.querySelector('.control-filters').insertAdjacentHTML('beforeend', '<label class="control-raben-filter-label" hidden>Stato Raben<select id="control-raben-filter"><option value="">Tutti gli esiti Raben</option><option>Registrata</option><option>Caricata</option><option>Prenotata</option><option>In transito</option><option>Centro di distribuzione</option><option>In consegna</option><option>Consegnata con riserva</option><option>Consegnata</option><option>Non verificato</option><option>Da verificare manualmente</option><option>Errore verifica</option><option>Spedizione non trovata</option><option>Intervento manuale richiesto</option><option>Eccezione Raben</option><option value="Archiviate">Archiviate</option></select></label><div class="control-filters-right"><label class="control-date-label"><span>Controllato dal</span><input id="control-date-filter" type="date"></label><button id="control-clear-filters" type="button" class="secondary control-clear-filters" hidden>Pulisci filtri</button></div>');
   card.querySelector('.control-filters').insertAdjacentHTML('afterend', '<div id="control-mapping-alert" class="control-mapping-alert" hidden></div>');
   card.querySelector('.control-filters').insertAdjacentHTML('afterend', '<div id="control-bulk-bar" class="control-bulk-bar" hidden><strong id="control-bulk-count">0 selezionate</strong><span>Shift + clic seleziona un intervallo</span><button id="control-bulk-verify" type="button">Verifica Raben</button><button id="control-bulk-sync-prestashop" type="button" class="secondary">Allinea stato PrestaShop</button><button id="control-bulk-sync-tracking" type="button" class="secondary"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8.5v4a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-4M8 1.5v8M5 6.5l3 3 3-3"/></svg><span>Invia tracking a PrestaShop</span></button><button id="control-bulk-export" type="button" class="secondary">Esporta CSV</button><button id="control-bulk-manage" type="button" class="secondary">Segna in lavorazione</button><button id="control-bulk-clear" type="button" class="secondary">Deseleziona</button></div>');
@@ -2755,6 +3022,17 @@ function setupControlWorkspace() {
     showFloatingToast('Filtri azzerati: ripristinato ordinamento dal più recente', 'info');
     controlPage = 1;
     refreshControlCenter();
+  });
+  $('#control-search-summary')?.addEventListener('click', (event) => {
+    if (!event.target.closest('[data-clear-control-search]')) return;
+    if ($('#global-tracking-query')) $('#global-tracking-query').value = '';
+    if ($('#control-search-query')) $('#control-search-query').value = '';
+    globalSearchResults = [];
+    closeGlobalSearch();
+    updateGlobalSearchClearButton();
+    controlPage = 1;
+    void refreshControlCenter();
+    $('#global-tracking-query')?.focus();
   });
   $('#control-bulk-clear').addEventListener('click', () => { controlSelectedTrackingNumbers.clear(); lastControlSelectedTrackingNumber = ''; refreshControlCenter(); });
   $('#control-bulk-verify').addEventListener('click', () => $('#verify-control-selected').click());
@@ -4797,11 +5075,14 @@ async function loadAuditLog() {
     }
     tbody.innerHTML = data.events.map((ev) => {
       const typeClass = ev.type || 'info';
+      const trackingCell = ev.trackingNumber
+        ? `<button type="button" class="open-audit-tracking-btn text-button" data-tracking="${escapeHtml(ev.trackingNumber)}" style="background:none;border:none;padding:0;color:var(--raben-blue);cursor:pointer;font-family:inherit;font-weight:500;font-variant-numeric:tabular-nums slashed-zero;">${escapeHtml(ev.trackingNumber)}</button>`
+        : '—';
       return `
         <tr>
           <td>${displayDateTime(ev.at)}</td>
           <td><span class="audit-type-badge ${escapeHtml(typeClass)}">${escapeHtml(ev.type || 'info')}</span></td>
-          <td><button type="button" class="open-audit-tracking-btn text-button" data-tracking="${escapeHtml(ev.trackingNumber)}" style="background:none;border:none;padding:0;color:var(--raben-blue);cursor:pointer;font-family:inherit;font-weight:500;font-variant-numeric:tabular-nums slashed-zero;">${escapeHtml(ev.trackingNumber)}</button></td>
+          <td>${trackingCell}</td>
           <td>${escapeHtml(ev.orderReference || '—')}</td>
           <td>${rabenBadge(ev.rabenStatus)}</td>
           <td><strong>${escapeHtml(ev.label || '—')}</strong></td>

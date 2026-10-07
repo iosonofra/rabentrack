@@ -10,7 +10,7 @@ import { DEFAULT_Raben_TRACKING_URL, Raben_PARSER_VERSION, Raben_SPEED_PROFILES,
 import { RabenCronService } from './raben-cron.js';
 import { CRON_PRESETS, CRON_TIME_ZONE, previewCronExpression } from './cron-scheduler.js';
 import { NotificationService } from './notification-service.js';
-import { archiveShipment, deleteArchivedShipment, deleteImportBatch, exportShipmentsData, getAuditLog, getControlCenter, getExistingShipmentsIndex, getImportBatches, getShipment, linkShipmentToPrestaShopOrder, registerImportBatch, restoreShipmentsData, syncAppliedShipments, syncRabenShipments, syncManualPrestaShopState, syncShipmentPrestaShopShipping, syncVerifiedShipments, updateShipmentCase } from './shipment-store.js';
+import { archiveShipment, deleteArchivedShipment, deleteImportBatch, exportShipmentsData, getAuditLog, getControlCenter, getExistingShipmentsIndex, getImportBatches, getOperationLog, getShipment, linkShipmentToPrestaShopOrder, registerImportBatch, registerOperation, restoreShipmentsData, searchShipments, syncAppliedShipments, syncRabenShipments, syncManualPrestaShopState, syncShipmentPrestaShopShipping, syncVerifiedShipments, updateShipmentCase } from './shipment-store.js';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -35,7 +35,7 @@ let connection = await loadSettings({
   baseUrl: process.env.PRESTASHOP_URL ?? '',
   apiKey: process.env.PRESTASHOP_WEBSERVICE_KEY ?? '',
   rabenBeta: { enabled: false, camofoxUrl: process.env.CAMOFOX_URL ?? 'http://127.0.0.1:9377', trackingUrl: process.env.RABEN_TRACKING_URL ?? DEFAULT_Raben_TRACKING_URL, speedProfile: 'safe' },
-  cron: normalizeCronSettings({ enabled: false, intervalMinutes: 60, nightPause: true, startHour: 8, endHour: 20, batchSize: 25 }),
+  cron: normalizeCronSettings({ enabled: false, intervalMinutes: 60, nightPause: true, pauseStartHour: 20, pauseEndHour: 8, batchSize: 25 }),
   notifications: normalizeNotificationSettings({}),
 });
 
@@ -57,6 +57,7 @@ const cronService = new RabenCronService({
   },
   syncManualState: syncManualPrestaShopState,
   notificationService,
+  recordOperation: (operation) => registerOperation({ scope: 'cron', ...operation }),
 });
 
 cronService.start();
@@ -132,13 +133,15 @@ app.get('/api/backup/export', async (_req, res) => {
     const dateStr = new Date().toISOString().slice(0, 10);
     const payload = {
       format: 'raben-tracking-center-backup',
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       stats: {
         shipmentsCount: shipmentsData.count,
+        operationsCount: shipmentsData.operations.length,
       },
       settings: settingsData,
       shipments: shipmentsData.shipments,
+      operations: shipmentsData.operations,
     };
     const filename = `raben-backup-${dateStr}.json`;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -183,7 +186,7 @@ app.post('/api/backup/restore', upload.single('file'), async (req, res) => {
       cronService.start();
     }
 
-    const { restoredCount } = await restoreShipmentsData(shipments);
+    const { restoredCount } = await restoreShipmentsData(shipments, payload.operations);
 
     res.json({
       success: true,
@@ -296,6 +299,14 @@ app.post('/api/raben-beta/jobs/:jobId/cancel', (req, res) => {
 
 app.get('/api/cron/status', (_req, res) => {
   res.json(cronService.getStatus());
+});
+
+app.get('/api/cron/log', async (req, res) => {
+  try {
+    res.json(await getOperationLog({ scope: 'cron', limit: req.query.limit }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/api/cron/presets', (_req, res) => {
@@ -581,6 +592,17 @@ app.get('/api/control-center', async (req, res) => {
     });
     res.json({ ...result, stateMappings: normalizeRabenStateMappings(connection.rabenStateMappings) });
   } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/search/suggestions', async (req, res) => {
+  try {
+    const query = String(req.query.query || '').trim().slice(0, 160);
+    if (query.length < 2) return res.json({ query, total: 0, results: [] });
+    const results = await searchShipments(query, req.query.limit);
+    res.json({ query, total: results.length, results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/api/control-center/:trackingNumber', async (req, res) => {

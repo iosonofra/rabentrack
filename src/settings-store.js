@@ -81,8 +81,16 @@ export function normalizeCronSettings(input = {}) {
   const presetIds = new Set(CRON_PRESETS.map((preset) => preset.id));
   const cronPreset = presetIds.has(String(input.cronPreset || '')) ? String(input.cronPreset) : '';
   const nightPause = input.nightPause !== undefined ? Boolean(input.nightPause) : true;
-  const startHour = Math.min(Math.max(Number(input.startHour) || 8, 0), 23);
-  const endHour = Math.min(Math.max(Number(input.endHour) || 20, 0), 23);
+  const normalizeHour = (value, fallback) => {
+    if (value === undefined || value === null || value === '') return fallback;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? Math.min(Math.max(Math.trunc(numeric), 0), 23) : fallback;
+  };
+  // I nuovi campi descrivono direttamente la fascia di pausa. Le vecchie
+  // configurazioni indicavano invece la finestra operativa (startHour/endHour),
+  // quindi vengono convertite senza invertirne il comportamento al primo avvio.
+  const pauseStartHour = normalizeHour(input.pauseStartHour, normalizeHour(input.endHour, 20));
+  const pauseEndHour = normalizeHour(input.pauseEndHour, normalizeHour(input.startHour, 8));
   const batchSize = Math.min(Math.max(Number(input.batchSize) || 25, 1), 100);
   const minCheckIntervalHours = Math.min(Math.max(Number(input.minCheckIntervalHours) || 2, 0.5), 72);
   const rawPriorities = input.statePriorities && typeof input.statePriorities === 'object' && !Array.isArray(input.statePriorities)
@@ -112,8 +120,8 @@ export function normalizeCronSettings(input = {}) {
     cronPreset,
     timeZone: CRON_TIME_ZONE,
     nightPause,
-    startHour,
-    endHour,
+    pauseStartHour,
+    pauseEndHour,
     batchSize,
     minCheckIntervalHours,
     statePriorities,

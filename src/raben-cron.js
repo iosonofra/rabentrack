@@ -27,13 +27,14 @@ export function isWithinActiveHours(config = {}, date = new Date()) {
   if (config.scheduleMode === 'cron') return true;
   if (!config.nightPause) return true;
   const hour = hourInTimeZone(date, config.timeZone || CRON_TIME_ZONE);
-  const start = Number(config.startHour ?? 8);
-  const end = Number(config.endHour ?? 20);
-  if (start <= end) {
-    return hour >= start && hour <= end;
-  }
-  // Finestra a cavallo della mezzanotte (es. 22:00 -> 06:00)
-  return hour >= start || hour <= end;
+  // Compatibilità: i vecchi campi rappresentavano la finestra attiva 08:00-20:00.
+  const pauseStart = Number(config.pauseStartHour ?? config.endHour ?? 20);
+  const pauseEnd = Number(config.pauseEndHour ?? config.startHour ?? 8);
+  if (pauseStart === pauseEnd) return true;
+  const isPaused = pauseStart < pauseEnd
+    ? hour >= pauseStart && hour < pauseEnd
+    : hour >= pauseStart || hour < pauseEnd;
+  return !isPaused;
 }
 
 export function selectCronCandidates(shipments = {}, options = {}) {
@@ -88,6 +89,7 @@ export class RabenCronService {
     applyOrderState,
     syncManualState,
     notificationService,
+    recordOperation,
     logger = console,
     jitterFn = () => 4000 + Math.floor(Math.random() * 2000),
   }) {
@@ -99,6 +101,7 @@ export class RabenCronService {
     this.applyOrderState = applyOrderState;
     this.syncManualState = syncManualState;
     this.notificationService = notificationService;
+    this.recordOperation = recordOperation;
     this.logger = logger;
     this.jitterFn = jitterFn;
 
@@ -112,6 +115,15 @@ export class RabenCronService {
     this.activeProgress = null;
     this.lastSlaCheckAt = 0;
     this.lastDigestSentDate = null;
+  }
+
+  async addOperation(action, detail = '', level = 'info', metadata = {}) {
+    if (!this.recordOperation) return;
+    try {
+      await this.recordOperation({ action, detail, level, metadata });
+    } catch (error) {
+      this.logger.error('[Raben-CRON] Impossibile registrare il log operativo:', error.message);
+    }
   }
 
   start() {
@@ -182,6 +194,18 @@ export class RabenCronService {
       await this.saveSettings(merged);
     }
     this.start();
+    const effective = this.getSettings()?.cron || merged.cron;
+    const schedule = effective.scheduleMode === 'cron'
+      ? describeCronExpression(effective.cronExpression)
+      : `ogni ${effective.intervalMinutes} minuti`;
+    await this.addOperation(
+      effective.enabled ? 'Configurazione cron aggiornata' : 'Controllo automatico disattivato',
+      effective.enabled
+        ? `${schedule}${effective.scheduleMode === 'interval' && effective.nightPause ? ` · pausa ${effective.pauseStartHour}:00–${effective.pauseEndHour}:00` : ''}`
+        : 'Le verifiche automatiche non verranno avviate.',
+      effective.enabled ? 'success' : 'warning',
+      { scheduleMode: effective.scheduleMode, enabled: Boolean(effective.enabled) },
+    );
     return this.getStatus();
   }
 
@@ -200,8 +224,8 @@ export class RabenCronService {
       scheduleDescription: config.scheduleMode === 'cron' ? describeCronExpression(config.cronExpression) : `Ogni ${Number(config.intervalMinutes) || 60} minuti`,
       nextRuns: this.upcomingRuns.map((date) => date.toISOString()),
       nightPause: Boolean(config.nightPause),
-      startHour: Number(config.startHour ?? 8),
-      endHour: Number(config.endHour ?? 20),
+      pauseStartHour: Number(config.pauseStartHour ?? config.endHour ?? 20),
+      pauseEndHour: Number(config.pauseEndHour ?? config.startHour ?? 8),
       batchSize: Number(config.batchSize) || 25,
       minCheckIntervalHours: Number(config.minCheckIntervalHours) || 2,
       statePriorities: config.statePriorities || FALLBACK_STATE_PRIORITIES,
@@ -218,6 +242,7 @@ export class RabenCronService {
   stopScan() {
     if (this.isRunning) {
       this.cancelRequested = true;
+      void this.addOperation('Interruzione richiesta', 'Il ciclo verrà fermato al termine della spedizione corrente.', 'warning');
       return { ok: true, message: 'Richiesta di interruzione inviata.' };
     }
     return { ok: false, message: 'Nessuna scansione in esecuzione.' };
@@ -239,13 +264,15 @@ export class RabenCronService {
         this.lastRunSummary = {
           at: new Date().toISOString(),
           type: 'skipped',
-          reason: `Pausa notturna attiva (orario attivo: ${config.startHour}:00 - ${config.endHour}:00)`,
+          reason: `Pausa notturna attiva (${config.pauseStartHour ?? config.endHour ?? 20}:00 - ${config.pauseEndHour ?? config.startHour ?? 8}:00)`,
         };
+        await this.addOperation('Ciclo automatico sospeso', this.lastRunSummary.reason, 'info', { trigger: 'automatic' });
         return;
       }
     }
 
     if (!rabenBetaConfig?.enabled) {
+      await this.addOperation('Ciclo non avviato', 'La verifica Raben via Camofox non è abilitata.', 'error', { trigger: manual ? 'manual' : 'automatic' });
       throw new Error('La funzionalità Raben Beta deve essere abilitata nelle impostazioni per usare Camofox.');
     }
 
@@ -255,6 +282,12 @@ export class RabenCronService {
     let betaClient = null;
 
     try {
+      await this.addOperation(
+        manual ? 'Verifica manuale avviata' : 'Ciclo automatico avviato',
+        `Limite del ciclo: ${Number(config.batchSize) || 25} spedizioni.`,
+        'info',
+        { trigger: manual ? 'manual' : 'automatic' },
+      );
       const db = await this.loadShipments();
       const candidates = selectCronCandidates(db?.shipments || {}, {
         ...config,
@@ -273,6 +306,12 @@ export class RabenCronService {
           durationSeconds: 0,
           reason: 'Nessuna spedizione in attesa da verificare',
         };
+        await this.addOperation(
+          manual ? 'Verifica manuale completata' : 'Ciclo automatico completato',
+          this.lastRunSummary.reason,
+          'success',
+          { trigger: manual ? 'manual' : 'automatic', checked: 0, errors: 0 },
+        );
         return this.lastRunSummary;
       }
 
@@ -409,7 +448,33 @@ export class RabenCronService {
         fallbackReason: betaClient.getRuntimeProfile?.().fallbackReason || '',
       };
 
+      const completionLevel = errorCount > 0 ? 'warning' : 'success';
+      const completionAction = this.cancelRequested
+        ? 'Ciclo interrotto'
+        : (manual ? 'Verifica manuale completata' : 'Ciclo automatico completato');
+      await this.addOperation(
+        completionAction,
+        `${this.lastRunSummary.checked} di ${candidates.length} spedizioni verificate · ${deliveredCount} consegnate · ${errorCount} errori · ${durationSeconds}s`,
+        this.cancelRequested ? 'warning' : completionLevel,
+        {
+          trigger: manual ? 'manual' : 'automatic',
+          checked: this.lastRunSummary.checked,
+          total: candidates.length,
+          delivered: deliveredCount,
+          errors: errorCount,
+          durationSeconds,
+        },
+      );
+
       return this.lastRunSummary;
+    } catch (error) {
+      await this.addOperation(
+        manual ? 'Verifica manuale fallita' : 'Ciclo automatico fallito',
+        error.message || 'Errore imprevisto durante il controllo.',
+        'error',
+        { trigger: manual ? 'manual' : 'automatic' },
+      );
+      throw error;
     } finally {
       await betaClient?.close?.();
       this.isRunning = false;

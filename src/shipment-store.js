@@ -14,6 +14,7 @@ async function load() {
   catch { database = { shipments: {} }; }
   database.shipments ||= {};
   database.batches ||= [];
+  database.operations ||= [];
   let migrated = false;
   for (const record of Object.values(database.shipments)) {
     const normalizedStatus = normalizeStoredRabenStatus(record.rabenStatus);
@@ -95,6 +96,89 @@ export function buildRabenStatusCounts(records) {
     output[status] = (output[status] || 0) + 1;
     return output;
   }, {});
+}
+
+export function normalizeShipmentSearchText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLocaleLowerCase('it-IT')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function compactShipmentSearchText(value) {
+  return normalizeShipmentSearchText(value).replace(/\s+/g, '');
+}
+
+export function rankShipmentSearchMatch(record = {}, query = '') {
+  const normalizedQuery = normalizeShipmentSearchText(query);
+  if (!normalizedQuery) return null;
+  const compactQuery = compactShipmentSearchText(query);
+  const tokens = normalizedQuery.split(' ').filter(Boolean);
+  const fields = [
+    ['trackingNumber', 'Tracking', record.trackingNumber, 1_000, true],
+    ['secondaryTrackingNumber', 'Tracking secondario', record.secondaryTrackingNumber, 950, true],
+    ['orderReference', 'Riferimento ordine', record.orderReference, 900, true],
+    ['orderReferenceRaw', 'Riferimento originale', record.orderReferenceRaw, 875, true],
+    ['orderId', 'ID ordine', record.orderId, 850, true],
+    ['recipient', 'Destinatario', record.recipient, 700, false],
+    ['rabenStatus', 'Stato Raben', normalizeStoredRabenStatus(record.rabenStatus), 620, false],
+    ['currentState', 'Stato PrestaShop', record.currentState, 600, false],
+    ['deliveryCity', 'Città di consegna', record.deliveryCity, 540, false],
+    ['deliveryLocation', 'Località di consegna', record.deliveryLocation, 520, false],
+  ].filter(([, , value]) => String(value || '').trim());
+
+  let best = null;
+  for (const [field, label, rawValue, weight, isCode] of fields) {
+    const value = String(rawValue).trim();
+    const normalizedValue = normalizeShipmentSearchText(value);
+    const compactValue = compactShipmentSearchText(value);
+    const directNeedle = isCode && compactQuery.length >= 2 ? compactQuery : normalizedQuery;
+    const directValue = isCode ? compactValue : normalizedValue;
+    let score = 0;
+    if (directValue === directNeedle) score = weight + 300;
+    else if (directValue.startsWith(directNeedle)) score = weight + 180;
+    else if (directValue.includes(directNeedle)) score = weight + 90;
+    if (score && (!best || score > best.score)) best = { field, label, value, score };
+  }
+
+  if (best) return best;
+  const corpus = fields.map(([, , value]) => normalizeShipmentSearchText(value)).join(' ');
+  if (tokens.every((token) => corpus.includes(token))) {
+    const field = fields.find(([, , value]) => tokens.some((token) => normalizeShipmentSearchText(value).includes(token)));
+    return { field: field?.[0] || 'shipment', label: field?.[1] || 'Spedizione', value: String(field?.[2] || ''), score: 250 + tokens.length * 10 };
+  }
+  return null;
+}
+
+export function searchShipmentRecords(records = [], query = '', limit = 6) {
+  const normalizedLimit = Math.min(20, Math.max(1, Number.parseInt(limit, 10) || 6));
+  return records
+    .map((record) => ({ record, match: rankShipmentSearchMatch(record, query) }))
+    .filter(({ match }) => Boolean(match))
+    .sort((left, right) => right.match.score - left.match.score
+      || Number(Boolean(left.record.archived)) - Number(Boolean(right.record.archived))
+      || String(right.record.rabenCheckedAt || right.record.lastSeenAt || '').localeCompare(String(left.record.rabenCheckedAt || left.record.lastSeenAt || '')))
+    .slice(0, normalizedLimit)
+    .map(({ record, match }) => ({
+      trackingNumber: record.trackingNumber,
+      secondaryTrackingNumber: record.secondaryTrackingNumber || '',
+      orderReference: record.orderReference || '',
+      orderId: record.orderId || '',
+      recipient: record.recipient || '',
+      rabenStatus: normalizeStoredRabenStatus(record.rabenStatus) || 'Non verificato',
+      currentState: record.currentState || '',
+      archived: Boolean(record.archived),
+      checkedAt: record.rabenCheckedAt || record.lastSeenAt || '',
+      match,
+    }));
+}
+
+export async function searchShipments(query, limit = 6) {
+  const db = await load();
+  return searchShipmentRecords(Object.values(db.shipments || {}), query, limit);
 }
 
 export async function getExistingShipmentsIndex() {
@@ -287,7 +371,7 @@ export function isShipmentTrackingUnsynced(record) {
 
 export async function getControlCenter({ query = '', status = '', rabenStatus = '', prestaState = '', unsynced = false, checkedAfter = '', exceptionOnly = false, archived = false, checkSort = 'desc', page = 1, pageSize = 50 } = {}) {
   const db = await load();
-  const needle = String(query).trim().toLocaleLowerCase('it-IT');
+  const searchQuery = String(query || '').trim().slice(0, 160);
   const isArchivedView = archived === true || archived === '1' || archived === 'true' || rabenStatus === 'Archiviate';
   const isUnsyncedView = unsynced === true || unsynced === '1' || unsynced === 'true';
   const allRecords = Object.values(db.shipments).map((record) => {
@@ -299,6 +383,7 @@ export async function getControlCenter({ query = '', status = '', rabenStatus = 
       rabenStatus: normRaben,
       operationalStatus: opStatus,
       isUnsynced: isShipmentTrackingUnsynced(record),
+      searchMatch: searchQuery ? rankShipmentSearchMatch(record, searchQuery) : null,
     };
   });
 
@@ -310,7 +395,7 @@ export async function getControlCenter({ query = '', status = '', rabenStatus = 
   const targetRecords = isArchivedView ? archivedRecords : activeRecords;
 
   const filteredWithoutPrestaState = targetRecords.filter((record) => {
-    const matchesQuery = !needle || [record.trackingNumber, record.orderReference, record.orderId, record.rabenStatus].some((value) => String(value || '').toLocaleLowerCase('it-IT').includes(needle));
+    const matchesQuery = !searchQuery || Boolean(record.searchMatch);
     const matchesStatus = matchesOperationalStatus(record.operationalStatus, status);
     const matchesRabenStatus = (!rabenStatus || rabenStatus === 'Archiviate') ? true : (record.rabenStatus || 'Non verificato') === rabenStatus;
     const matchesCheckedAfter = !checkedAfter || String(record.rabenCheckedAt || record.lastSeenAt || '') >= `${checkedAfter}T00:00:00.000Z`;
@@ -334,6 +419,9 @@ export async function getControlCenter({ query = '', status = '', rabenStatus = 
     if (normalizedPrestaState === '__unavailable__') return Boolean(record.orderId) && !String(record.currentState || '').trim();
     return String(record.currentState || '').trim().toLocaleLowerCase('it-IT') === normalizedPrestaState.toLocaleLowerCase('it-IT');
   }).sort((a, b) => {
+    if (searchQuery && Number(b.searchMatch?.score || 0) !== Number(a.searchMatch?.score || 0)) {
+      return Number(b.searchMatch?.score || 0) - Number(a.searchMatch?.score || 0);
+    }
     const timeA = String(a.rabenCheckedAt || a.lastSeenAt || '');
     const timeB = String(b.rabenCheckedAt || b.lastSeenAt || '');
     if (!timeA && !timeB) return String(a.trackingNumber || '').localeCompare(String(b.trackingNumber || ''));
@@ -434,10 +522,11 @@ export async function exportShipmentsData() {
   return {
     count: Object.keys(db.shipments || {}).length,
     shipments: db.shipments || {},
+    operations: db.operations || [],
   };
 }
 
-export async function restoreShipmentsData(importedShipments) {
+export async function restoreShipmentsData(importedShipments, importedOperations = null) {
   if (!importedShipments || typeof importedShipments !== 'object' || Array.isArray(importedShipments)) {
     throw new Error('Dati spedizioni non validi per il ripristino.');
   }
@@ -448,7 +537,21 @@ export async function restoreShipmentsData(importedShipments) {
   } catch {
     // Nessun backup precedente da archiviare se il file non esisteva
   }
-  database = { shipments: { ...importedShipments }, batches: database?.batches || [] };
+  database = {
+    shipments: { ...importedShipments },
+    batches: database?.batches || [],
+    operations: Array.isArray(importedOperations)
+      ? importedOperations.slice(0, 200).map((operation) => ({
+        id: String(operation?.id || `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).slice(0, 120),
+        at: String(operation?.at || now()).slice(0, 40),
+        scope: String(operation?.scope || 'system').slice(0, 40),
+        level: ['info', 'success', 'warning', 'error'].includes(operation?.level) ? operation.level : 'info',
+        action: String(operation?.action || 'Operazione ripristinata').slice(0, 160),
+        detail: String(operation?.detail || '').slice(0, 2_000),
+        metadata: operation?.metadata && typeof operation.metadata === 'object' && !Array.isArray(operation.metadata) ? operation.metadata : {},
+      }))
+      : (database?.operations || []),
+  };
   await persist();
   return {
     restoredCount: Object.keys(database.shipments).length,
@@ -583,6 +686,21 @@ export async function getAuditLog({ type = '', query = '', dateFrom = '', dateTo
     }
   }
 
+  for (const operation of db.operations || []) {
+    allEvents.push({
+      at: operation.at,
+      type: operation.scope || 'sistema',
+      label: operation.action || '',
+      detail: operation.detail || '',
+      trackingNumber: '',
+      orderReference: '',
+      orderId: '',
+      currentState: '—',
+      rabenStatus: '—',
+      archived: false,
+    });
+  }
+
   allEvents.sort((a, b) => String(b.at).localeCompare(String(a.at)));
 
   const filtered = allEvents.filter((ev) => {
@@ -608,4 +726,37 @@ export async function getAuditLog({ type = '', query = '', dateFrom = '', dateTo
     total: filtered.length,
     events: filtered.slice(0, Math.max(10, Number(limit) || 300)),
   };
+}
+
+export async function registerOperation({ scope = 'system', level = 'info', action = '', detail = '', metadata = {} } = {}) {
+  const db = await load();
+  const allowedLevels = new Set(['info', 'success', 'warning', 'error']);
+  const normalizedScope = String(scope || 'system').trim().slice(0, 40) || 'system';
+  const normalizedAction = String(action || '').trim().slice(0, 160);
+  if (!normalizedAction) throw new Error('Azione del log operativo mancante.');
+  const safeMetadata = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? Object.fromEntries(Object.entries(metadata).slice(0, 20).map(([key, value]) => [String(key).slice(0, 80), typeof value === 'string' ? value.slice(0, 500) : value]))
+    : {};
+  const operation = {
+    id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    at: now(),
+    scope: normalizedScope,
+    level: allowedLevels.has(level) ? level : 'info',
+    action: normalizedAction,
+    detail: String(detail || '').trim().slice(0, 2_000),
+    metadata: safeMetadata,
+  };
+  db.operations ||= [];
+  db.operations.unshift(operation);
+  db.operations = db.operations.slice(0, 200);
+  await persist();
+  return operation;
+}
+
+export async function getOperationLog({ scope = '', limit = 20 } = {}) {
+  const db = await load();
+  const normalizedScope = String(scope || '').trim();
+  const normalizedLimit = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
+  const operations = (db.operations || []).filter((operation) => !normalizedScope || operation.scope === normalizedScope);
+  return { total: operations.length, operations: operations.slice(0, normalizedLimit) };
 }
