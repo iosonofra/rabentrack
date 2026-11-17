@@ -15,7 +15,7 @@ const TRACKING_POLL_TIMEOUT_MS = 18_000;
 const TRACKING_POLL_INTERVAL_MS = 700;
 const FAST_TRACKING_POLL_INTERVALS_MS = [250, 500, 800, 1200];
 const ULTRA_TRACKING_POLL_INTERVALS_MS = [100, 200, 350, 600];
-export const Raben_PARSER_VERSION = 10;
+export const Raben_PARSER_VERSION = 11;
 export const DEFAULT_Raben_TRACKING_URL = 'https://oftc.myraben.com/link/ShipmentInformation?ShipmentNumber=TRACKINGDAINSERIRE&Language=IT';
 
 export const Raben_SPEED_PROFILES = Object.freeze({
@@ -76,10 +76,19 @@ const Raben_STATUS_RULES = [
 ];
 
 export function canonicalRabenStatus(value) {
+  if (isRabenTableHeader(value)) return null;
   return Raben_STATUS_RULES.find((rule) => rule.expression.test(String(value)))?.status || null;
 }
 
+export function isRabenTableHeader(value) {
+  const label = cleanSnapshot(value).replace(/["'“”]/g, '').trim();
+  return /(?:paese|country)\s+(?:città\s*\/\s*deposito|city\s*\/\s*depot|location)/i.test(label)
+    || /^(?:data\s+(?:ora\s+)?stato della spedizione|date\s+(?:time\s+)?shipment status)/i.test(label)
+    || /^(?:paese|città\s*\/\s*deposito|osservazioni|country|city\s*\/\s*depot|remarks)$/i.test(label);
+}
+
 export function normalizeDiscoveredRabenStatus(value) {
+  if (isRabenTableHeader(value)) return '';
   const label = cleanSnapshot(value)
     .replace(/^(?:stato(?: della)? spedizione|shipment status)\s*[:\-]\s*/i, '')
     .replace(/[.:;,\-\s]+$/, '')
@@ -125,7 +134,8 @@ export function parseRabenStatusSnapshot(snapshot) {
   for (const pattern of labelledPatterns) {
     const match = raw.match(pattern);
     const canonical = match && canonicalRabenStatus(match[1]);
-    const status = canonical || (match && normalizeDiscoveredRabenStatus(match[1]));
+    // A table's column heading is not an explicit current-status field.
+    const status = canonical || (match && !/\b(?:row|columnheader)\b/i.test(match.input.slice(Math.max(0, match.index - 40), match.index)) && normalizeDiscoveredRabenStatus(match[1]));
     if (status) return statusResult(status, canonical ? 'Stato corrente letto dalla pagina pubblica Raben.' : 'Nuovo stato corrente scoperto nel campo stato Raben.', { evidence: 'label', confidence: .9, reasonCode: canonical ? 'STATUS_CONFIRMED' : 'STATUS_DISCOVERED', rawStatus: match[1] });
   }
 
@@ -152,7 +162,54 @@ export function normalizeRabenTimeline(rows) {
       location,
       reason: cleanSnapshot(row?.reason).slice(0, 300),
     };
-  }).filter((row) => row.event || row.date || row.location || row.reason);
+  }).filter((row) => !isRabenTableHeader(row.event) && (row.event || row.date || row.location || row.reason));
+}
+
+// Recover dated history from accessibility snapshots if DOM evaluation fails.
+export function parseRabenSnapshotEvidence(snapshot) {
+  const timeline = [];
+  let cells = [];
+  let rowText = '';
+  let inHistory = false;
+  let previousText = '';
+  const summary = {};
+  const unquote = (value) => {
+    try { return JSON.parse(value); } catch { return value.replace(/^"|"$/g, ''); }
+  };
+  const flush = () => {
+    if (!inHistory) return;
+    if (cells.length >= 3 && parseRabenEventDate(cells[0]).local) {
+      const separateTime = /^\d{1,2}:\d{2}$/.test(cells[1]);
+      const index = separateTime ? 2 : 1;
+      timeline.push({ date: [cells[0], separateTime ? cells[1] : ''].filter(Boolean).join(' '), event: cells[index], country: cells[index + 1], location: cells[index + 2], reason: cells[index + 3] });
+    } else {
+      const match = rowText.match(/^(\d{1,2}[./-]\d{1,2}[./-]\d{4})\s+(\d{1,2}:\d{2})\s+(.+)$/);
+      if (match) {
+        const [, date, time, rest] = match;
+        const country = rest.match(/\s+(Italia|Italy|Polonia|Poland|Germania|Germany|Francia|France|Paesi Bassi|Netherlands)\b/i);
+        const event = country ? rest.slice(0, country.index) : rest;
+        timeline.push({ date: date + ' ' + time, event, country: country?.[1] || '', location: country ? rest.slice(country.index + country[0].length).trim() : '' });
+      }
+    }
+  };
+  for (const line of String(snapshot || '').split(/\r?\n/)) {
+    if (/^\s*- table(?:\s|:|$)/.test(line)) { flush(); cells = []; rowText = ''; inHistory = false; }
+    const row = line.match(/^\s*- row\s+(".*?")\s*:?\s*$/);
+    if (row) {
+      flush(); cells = []; rowText = unquote(row[1]);
+      if (/stato della spedizione|shipment status/i.test(rowText) && /data|date/i.test(rowText)) inHistory = true;
+    }
+    const cell = line.match(/^\s*- (?:cell|gridcell)\s+(".*?")\s*:?\s*$/);
+    if (cell) cells.push(unquote(cell[1]));
+    const text = line.match(/^\s*- (?:generic|text|paragraph):\s*(.+)$/);
+    if (text) {
+      const value = unquote(text[1]).trim();
+      if (/^Status$/i.test(value) && previousText && !isRabenTableHeader(previousText)) summary.status = previousText;
+      previousText = value;
+    }
+  }
+  flush();
+  return { summary, timeline: normalizeRabenTimeline(timeline) };
 }
 
 export function parseRabenEventDate(value) {
@@ -410,7 +467,7 @@ export class RabenBetaClient {
       for (const doc of documents) {
         const tables = Array.from(doc.querySelectorAll('table'));
         const rabenTable = tables.find((item) => /stato della spedizione|shipment status/i.test(text(item)) && /data|date/i.test(text(item)));
-        if (rabenTable) timeline.push(...Array.from(rabenTable.querySelectorAll('tbody tr')).map((row) => makeRabenRow(Array.from(row.querySelectorAll('td')).map((cell) => cell.innerText))));
+        if (rabenTable) timeline.push(...Array.from(rabenTable.querySelectorAll('tr')).map((row) => Array.from(row.querySelectorAll('td')).map(text)).filter((cells) => cells.length >= 3 && /^\\d{1,2}[./-]\\d{1,2}[./-]\\d{4}/.test(cells[0])).map(makeRabenRow));
         const genericTable = tables.find((item) => /evento|event/i.test(text(item)) && /data|date/i.test(text(item)) && /localit|location/i.test(text(item)));
         if (genericTable) timeline.push(...Array.from(genericTable.querySelectorAll('tbody tr')).map((row) => makeRow(Array.from(row.querySelectorAll('td')).map((cell) => cell.innerText))));
         const rows = Array.from(doc.querySelectorAll('[role="row"]')).map((row) => Array.from(row.querySelectorAll('[role="cell"], [role="gridcell"]')).map((cell) => cell.innerText));
@@ -438,11 +495,14 @@ export class RabenBetaClient {
       const domEvidence = await this.extractDomEvidence(tabId).catch(() => lastEvidence);
       lastEvidence = domEvidence;
       const domResult = parseRabenDomEvidence(domEvidence);
-      if (acceleratedMode && domResult?.status !== 'Da verificare manualmente' && domResult?.confidence >= .9) {
+      if (acceleratedMode && domEvidence.timeline.length && domResult?.status !== 'Da verificare manualmente' && domResult?.confidence >= .9) {
         return { result: domResult, timeline: domEvidence.timeline, summary: domEvidence.summary };
       }
       const page = await snapshot();
-      const candidates = [parseRabenStatusSnapshot(page), domResult].filter(Boolean).sort((a, b) => b.confidence - a.confidence);
+      const recovered = parseRabenSnapshotEvidence(page);
+      if (!domEvidence.timeline.length && recovered.timeline.length) domEvidence.timeline = recovered.timeline;
+      if (!domEvidence.summary.status && recovered.summary.status) domEvidence.summary = { ...domEvidence.summary, ...recovered.summary };
+      const candidates = [parseRabenStatusSnapshot(page), parseRabenDomEvidence(domEvidence), domResult].filter(Boolean).sort((a, b) => b.confidence - a.confidence);
       const current = candidates[0];
       if (!best || current.confidence > best.confidence) best = current;
       if (current.status !== 'Da verificare manualmente') {

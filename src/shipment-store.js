@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { findRabenStatusEvent, normalizeRabenTimeline, parseRabenEventDate } from './raben-beta-client.js';
+import { findRabenStatusEvent, isRabenTableHeader, normalizeRabenTimeline, parseRabenEventDate } from './raben-beta-client.js';
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const storePath = join(projectRoot, 'data', 'shipments.json');
@@ -15,6 +15,26 @@ async function load() {
   database.shipments ||= {};
   database.batches ||= [];
   database.operations ||= [];
+  const invalidRecords = Object.values(database.shipments).filter((record) => isRabenTableHeader(record.rabenStatus));
+  const invalidRegistry = (database.discoveredRabenStatuses || []).some((entry) => isRabenTableHeader(entry?.status));
+  if (invalidRecords.length || invalidRegistry) {
+    // Preserve the original data before the one-time header cleanup.
+    await writeFile(`${storePath}.pre-header-fix.bak`, JSON.stringify(database), { encoding: 'utf8', flag: 'wx' }).catch((error) => {
+      if (error.code !== 'EEXIST') throw error;
+    });
+    for (const record of invalidRecords) {
+      record.rabenInvalidatedStatus = record.rabenStatus;
+      record.rabenStatus = 'Non verificato';
+      record.rabenDetail = 'Intestazione tabella scartata: ripetere la verifica Raben per acquisire stato e storico.';
+      record.rabenReasonCode = 'INVALID_TABLE_HEADER';
+      record.rabenConfidence = 0;
+      record.rabenCheckedAt = '';
+      record.rabenStatusAt = '';
+      record.rabenStatusDateRaw = '';
+      record.rabenStatusDatePrecision = '';
+    }
+    database.discoveredRabenStatuses = (database.discoveredRabenStatuses || []).filter((entry) => !isRabenTableHeader(entry?.status));
+  }
   database.discoveredRabenStatuses = Array.isArray(database.discoveredRabenStatuses)
     ? database.discoveredRabenStatuses.slice(0, 200).map((entry) => ({
       status: String(entry?.status || '').trim().slice(0, 80),
@@ -24,7 +44,7 @@ async function load() {
       occurrences: Math.max(1, Number(entry?.occurrences) || 1),
     })).filter((entry) => entry.status)
     : [];
-  let migrated = false;
+  let migrated = invalidRecords.length > 0 || invalidRegistry;
   for (const record of Object.values(database.shipments)) {
     const storedStatus = normalizeStoredRabenStatus(record.rabenStatus);
     const recoveredRawStatus = normalizeStoredRabenStatus(record.rabenRawStatus);
