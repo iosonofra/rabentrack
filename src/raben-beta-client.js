@@ -370,15 +370,23 @@ export class RabenBetaClient {
   async extractDomEvidence(tabId) {
     const expression = `(() => {
       const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      // Cache valido solo per questa lettura: nessun dato sopravvive al polling.
+      const textCache = new WeakMap();
+      const text = (node) => {
+        if (!node) return '';
+        if (!textCache.has(node)) textCache.set(node, clean(node.innerText || node.textContent));
+        return textCache.get(node);
+      };
       const makeRow = (cells) => ({ event: clean(cells[0]), country: clean(cells[1]), date: clean(cells[2]), location: clean(cells[3]), reason: clean(cells[4]) });
       const makeRabenRow = (cells) => ({ date: clean([cells[0], cells[1]].filter(Boolean).join(' ')), event: clean(cells[2]), country: clean(cells[3]), location: clean(cells[4]), reason: clean(cells[5]) });
       const documents = [document];
       for (const frame of document.querySelectorAll('iframe')) { try { if (frame.contentDocument) documents.push(frame.contentDocument); } catch {} }
+      const labels = documents.map((doc) => Array.from(doc.querySelectorAll('label')));
       const fieldValue = (labelPattern) => {
-        for (const doc of documents) {
-          const label = Array.from(doc.querySelectorAll('label')).find((node) => labelPattern.test(clean(node.innerText || node.textContent)));
+        for (const documentLabels of labels) {
+          const label = documentLabels.find((node) => labelPattern.test(text(node)));
           const value = label?.parentElement?.querySelector('.form-control-static');
-          if (value) return clean(value.innerText || value.textContent);
+          if (value) return text(value);
         }
         return '';
       };
@@ -390,17 +398,20 @@ export class RabenBetaClient {
         grossWeight: fieldValue(/^Peso lordo/i),
         cubicMeters: fieldValue(/^Metri cubi$/i),
       };
-      const headings = documents.flatMap((doc) => Array.from(doc.querySelectorAll('h1,h2,h3,[role="heading"]')).map((node) => clean(node.innerText || node.textContent))).filter(Boolean).slice(0, 30);
       const statusPattern = /^(?:registrat[ao](?: a sistema)?|caricat[ao]|scaricat[ao]|in transito|in consegna|in corso(?: - parere richiesto)?|inventario a magazzino|consegnat[ao](?: con osservazioni)?|non consegnat[ao].*|non ritirat[ao].*)$/i;
-      const summaryTexts = documents.flatMap((doc) => Array.from(doc.querySelectorAll('span,div,td,dd,strong')).filter((node) => node.children.length === 0).map((node) => clean(node.innerText || node.textContent)).filter((value) => statusPattern.test(value))).slice(0, 12);
+      // Un riepilogo noto ha già precedenza su tutte le ricerche generiche.
+      // In sua assenza si mantiene integralmente il percorso di recupero.
+      const knownSummary = ${JSON.stringify(Raben_STATUS_RULES.map((rule) => ({ source: rule.expression.source, flags: rule.expression.flags })))}.some((rule) => new RegExp(rule.source, rule.flags).test(summary.status));
+      const headings = knownSummary ? [] : documents.flatMap((doc) => Array.from(doc.querySelectorAll('h1,h2,h3,[role="heading"]')).map(text)).filter(Boolean).slice(0, 30);
+      const summaryTexts = knownSummary ? [] : documents.flatMap((doc) => Array.from(doc.querySelectorAll('span,div,td,dd,strong')).filter((node) => node.children.length === 0).map(text).filter((value) => statusPattern.test(value))).slice(0, 12);
       const activeSelector = '[aria-current="true"],[aria-current="step"],[aria-selected="true"],.active,.selected,.current,[class*="active"],[class*="selected"],[class*="current"]';
-      const activeTexts = documents.flatMap((doc) => Array.from(doc.querySelectorAll(activeSelector)).map((node) => clean(node.innerText || node.textContent)).filter((value) => value.length <= 160 && /registrat|caricat|scaricat|transit|consegn|deliver|inventario|in corso|parere|ritirat|loaded|exception/i.test(value))).slice(0, 20);
+      const activeTexts = knownSummary ? [] : documents.flatMap((doc) => Array.from(doc.querySelectorAll(activeSelector)).map(text).filter((value) => value.length <= 160 && /registrat|caricat|scaricat|transit|consegn|deliver|inventario|in corso|parere|ritirat|loaded|exception/i.test(value))).slice(0, 20);
       const timeline = [];
       for (const doc of documents) {
         const tables = Array.from(doc.querySelectorAll('table'));
-        const rabenTable = tables.find((item) => /stato della spedizione|shipment status/i.test(item.innerText) && /data|date/i.test(item.innerText));
+        const rabenTable = tables.find((item) => /stato della spedizione|shipment status/i.test(text(item)) && /data|date/i.test(text(item)));
         if (rabenTable) timeline.push(...Array.from(rabenTable.querySelectorAll('tbody tr')).map((row) => makeRabenRow(Array.from(row.querySelectorAll('td')).map((cell) => cell.innerText))));
-        const genericTable = tables.find((item) => /evento|event/i.test(item.innerText) && /data|date/i.test(item.innerText) && /localit|location/i.test(item.innerText));
+        const genericTable = tables.find((item) => /evento|event/i.test(text(item)) && /data|date/i.test(text(item)) && /localit|location/i.test(text(item)));
         if (genericTable) timeline.push(...Array.from(genericTable.querySelectorAll('tbody tr')).map((row) => makeRow(Array.from(row.querySelectorAll('td')).map((cell) => cell.innerText))));
         const rows = Array.from(doc.querySelectorAll('[role="row"]')).map((row) => Array.from(row.querySelectorAll('[role="cell"], [role="gridcell"]')).map((cell) => cell.innerText));
         timeline.push(...rows.filter((cells) => cells.length >= 6 && !/data|date/i.test(cells[0] || '')).map(makeRabenRow));

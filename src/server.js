@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import express from 'express';
 import multer from 'multer';
+import { createFrontendAssets } from './frontend-assets.js';
 import { readRabenWorkbook } from './excel-import.js';
 import { isImportRowEligible, normalizeImportOptions } from './import-eligibility.js';
 import { PrestaShopClient } from './prestashop-client.js';
@@ -64,7 +65,8 @@ cronService.start();
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-app.use(express.static('public', { etag: false, maxAge: 0, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate') }));
+app.use(createFrontendAssets());
+app.use(express.static('public', { setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache') }));
 
 function client() {
   if (!connection.baseUrl || !connection.apiKey) throw new Error('Inserisci URL e chiave Webservice di PrestaShop.');

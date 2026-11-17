@@ -262,6 +262,8 @@ bash scripts/update.sh
 
 Durante l'aggiornamento viene chiesto se aggiornare anche il **browser Camoufox**. La scelta predefinita è **No**: se l'operatore non risponde entro 30 secondi, il browser installato viene mantenuto. L'applicazione, le dipendenze Node.js e i servizi vengono comunque aggiornati e riavviati.
 
+Se Git scarica una nuova versione dello stesso script di aggiornamento, il processo si riavvia automaticamente una sola volta prima di installare le dipendenze. In questo modo vengono applicate subito anche le nuove regole di aggiornamento di Camoufox, senza continuare con la precedente versione dello script già in memoria.
+
 Per gli aggiornamenti automatizzati o non interattivi è possibile decidere esplicitamente:
 
 ```bash

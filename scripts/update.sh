@@ -66,6 +66,7 @@ if [ "${RABEN_SKIP_GIT_UPDATE:-0}" = "1" ]; then
 elif [ -d ".git" ]; then
     echo "Scaricamento ultimi aggiornamenti da Git..."
     CURRENT_BRANCH="$(git -c safe.directory="${APP_DIR}" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)"
+    PREVIOUS_REVISION="$(git -c safe.directory="${APP_DIR}" rev-parse HEAD 2>/dev/null || true)"
     if ! git -c safe.directory="${APP_DIR}" diff --quiet || ! git -c safe.directory="${APP_DIR}" diff --cached --quiet; then
         echo "Errore: sono presenti modifiche locali ai file versionati; aggiornamento interrotto per non sovrascriverle." >&2
         git -c safe.directory="${APP_DIR}" status --short >&2
@@ -74,8 +75,20 @@ elif [ -d ".git" ]; then
     fi
     git -c safe.directory="${APP_DIR}" fetch --prune origin
     git -c safe.directory="${APP_DIR}" merge --ff-only "origin/${CURRENT_BRANCH}"
+    UPDATED_REVISION="$(git -c safe.directory="${APP_DIR}" rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "${PREVIOUS_REVISION}" ] && [ "${PREVIOUS_REVISION}" != "${UPDATED_REVISION}" ] && [ "${RABEN_UPDATE_REEXEC:-0}" != "1" ]; then
+        echo "Nuovi file installati: riavvio lo script aggiornato prima di proseguire..."
+        exec env RABEN_UPDATE_REEXEC=1 bash "${APP_DIR}/scripts/update.sh"
+    fi
 else
     echo "Nessun repository Git rilevato: applicazione aggiornamento dai file locali estratti."
+fi
+
+UPDATE_CAMOFOX=0
+if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then
+    if should_update_camofox; then
+        UPDATE_CAMOFOX=1
+    fi
 fi
 
 echo "${YELLOW}==> 2/3 Aggiornamento dipendenze...${NC}"
@@ -97,18 +110,16 @@ npm ci --omit=dev || npm install --omit=dev
 # ignore-scripts=true e rende visibile la correzione nel log di aggiornamento.
 node scripts/patch-camoufox-js.js
 
-if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then
-    if should_update_camofox; then
-        echo "Aggiornamento del browser Camoufox..."
-        mkdir -p "${APP_DIR}/.cache/camoufox"
-        if [ "$(id -u)" -eq 0 ] && id raben >/dev/null 2>&1; then
-            chown -R raben:raben "${APP_DIR}/.cache/camoufox"
-            runuser -u raben -- env CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
-        else
-            CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
-        fi
-        echo "Browser Camoufox aggiornato."
+if [ "${UPDATE_CAMOFOX}" = "1" ]; then
+    echo "Aggiornamento del browser Camoufox..."
+    mkdir -p "${APP_DIR}/.cache/camoufox"
+    if [ "$(id -u)" -eq 0 ] && id raben >/dev/null 2>&1; then
+        chown -R raben:raben "${APP_DIR}/.cache/camoufox"
+        runuser -u raben -- env CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
+    else
+        CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
     fi
+    echo "Browser Camoufox aggiornato."
 fi
 
 # Preserva permessi

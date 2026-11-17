@@ -42,6 +42,8 @@ const INCLUDED_ROOT_FILES = [
   'README.md',
   '006-cron-priorita-orari.md',
   'DEPLOY_PROXMOX.md',
+  'BROWSER-OPTIMIZATION-ROLLBACK.md',
+  'FRONTEND-OPTIMIZATION-ROLLBACK.md',
   'DESIGN.md',
   'PRODUCT.md'
 ];
