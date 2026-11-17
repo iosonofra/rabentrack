@@ -14,6 +14,50 @@ NC='\033[0m'
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${APP_DIR}"
 
+should_update_camofox() {
+    case "${RABEN_UPDATE_CAMOFOX:-ask}" in
+        1|true|TRUE|yes|YES|si|SI)
+            echo "Aggiornamento browser Camoufox richiesto tramite RABEN_UPDATE_CAMOFOX."
+            return 0
+            ;;
+        0|false|FALSE|no|NO)
+            echo "Aggiornamento browser Camoufox disattivato tramite RABEN_UPDATE_CAMOFOX."
+            return 1
+            ;;
+        ask|'') ;;
+        *)
+            echo "Valore RABEN_UPDATE_CAMOFOX non riconosciuto: uso NO per sicurezza." >&2
+            return 1
+            ;;
+    esac
+
+    if [ ! -t 0 ]; then
+        echo "Sessione non interattiva: browser Camoufox non aggiornato (predefinito NO)."
+        return 1
+    fi
+
+    if ! command -v timeout >/dev/null 2>&1; then
+        echo "Comando timeout non disponibile: browser Camoufox non aggiornato per evitare una richiesta bloccante." >&2
+        return 1
+    fi
+
+    printf "Aggiornare anche il browser Camoufox? [s/N] (risposta entro 30 secondi): "
+    if CAMOFOX_ANSWER="$(timeout 30 sh -c 'IFS= read -r answer || exit 1; printf "%s" "$answer"')"; then
+        printf '\n'
+    else
+        CAMOFOX_ANSWER=""
+        printf '\nTempo scaduto: selezionato automaticamente NO.\n'
+    fi
+
+    case "${CAMOFOX_ANSWER}" in
+        s|S|si|SI|Si|sì|SÌ|y|Y|yes|YES|Yes) return 0 ;;
+        *)
+            echo "Browser Camoufox mantenuto alla versione attualmente installata."
+            return 1
+            ;;
+    esac
+}
+
 echo "${BLUE}${BOLD}Aggiornamento Raben - Tracking Center...${NC}"
 
 echo "${YELLOW}==> 1/3 Verifica sorgenti e aggiornamenti...${NC}"
@@ -54,13 +98,16 @@ npm ci --omit=dev || npm install --omit=dev
 node scripts/patch-camoufox-js.js
 
 if systemctl is-enabled --quiet camofox 2>/dev/null || [ -f /etc/systemd/system/camofox.service ]; then
-    echo "Aggiornamento del browser Camoufox..."
-    mkdir -p "${APP_DIR}/.cache/camoufox"
-    if [ "$(id -u)" -eq 0 ] && id raben >/dev/null 2>&1; then
-        chown -R raben:raben "${APP_DIR}/.cache/camoufox"
-        runuser -u raben -- env CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
-    else
-        CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
+    if should_update_camofox; then
+        echo "Aggiornamento del browser Camoufox..."
+        mkdir -p "${APP_DIR}/.cache/camoufox"
+        if [ "$(id -u)" -eq 0 ] && id raben >/dev/null 2>&1; then
+            chown -R raben:raben "${APP_DIR}/.cache/camoufox"
+            runuser -u raben -- env CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
+        else
+            CAMOUFOX_INSTALL_DIR="${APP_DIR}/.cache/camoufox" ./node_modules/.bin/camoufox-js fetch
+        fi
+        echo "Browser Camoufox aggiornato."
     fi
 fi
 

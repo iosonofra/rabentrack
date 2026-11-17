@@ -15,7 +15,7 @@ const TRACKING_POLL_TIMEOUT_MS = 18_000;
 const TRACKING_POLL_INTERVAL_MS = 700;
 const FAST_TRACKING_POLL_INTERVALS_MS = [250, 500, 800, 1200];
 const ULTRA_TRACKING_POLL_INTERVALS_MS = [100, 200, 350, 600];
-export const Raben_PARSER_VERSION = 8;
+export const Raben_PARSER_VERSION = 10;
 export const DEFAULT_Raben_TRACKING_URL = 'https://oftc.myraben.com/link/ShipmentInformation?ShipmentNumber=TRACKINGDAINSERIRE&Language=IT';
 
 export const Raben_SPEED_PROFILES = Object.freeze({
@@ -62,11 +62,14 @@ function findRef(snapshot, expression) {
 const Raben_STATUS_RULES = [
   { status: 'Consegnata con riserva', expression: /\b(?:consegnat[ao] con (?:osservazioni|riserva)|delivered with remarks?)\b/i },
   { status: 'Prenotata', expression: /\b(?:consegnat[ao] al terminal(?: dal mittente)?|terminal dal mittente|delivered to (?:the )?(?:sender )?terminal)\b/i },
+  { status: 'In corso', expression: /\bin corso(?:\s*-\s*parere richiesto)?\b/i },
+  { status: 'Inventario a magazzino', expression: /\binventario(?: a magazzino)?\b/i },
+  { status: 'Scaricato', expression: /\bscaricat[ao]\b/i },
   { status: 'Eccezione Raben', expression: /\b(?:non consegnat[ao]|non ritirat[ao]|parere richiesto|parametri errati|delivery failed|exception)\b/i },
   { status: 'Consegnata', expression: /\b(?:consegnat[ao]|delivered)\b/i },
   { status: 'In consegna', expression: /\b(?:in consegna|out for delivery)\b/i },
   { status: 'In transito', expression: /\b(?:partit[ao]|departed)\b/i },
-  { status: 'In transito', expression: /\b(?:in transito|in transit|scaricat[ao]|inventario a magazzino|nuova data di consegna|in corso)\b/i },
+  { status: 'In transito', expression: /\b(?:in transito|in transit|nuova data di consegna)\b/i },
   { status: 'Prenotata', expression: /\b(?:prenotat[ao]|booked)\b/i },
   { status: 'Caricata', expression: /\b(?:caricat[ao]|loaded)\b/i },
   { status: 'Registrata', expression: /\b(?:registrat[ao] a sistema|registered)\b/i },
@@ -74,6 +77,18 @@ const Raben_STATUS_RULES = [
 
 export function canonicalRabenStatus(value) {
   return Raben_STATUS_RULES.find((rule) => rule.expression.test(String(value)))?.status || null;
+}
+
+export function normalizeDiscoveredRabenStatus(value) {
+  const label = cleanSnapshot(value)
+    .replace(/^(?:stato(?: della)? spedizione|shipment status)\s*[:\-]\s*/i, '')
+    .replace(/[.:;,\-\s]+$/, '')
+    .slice(0, 80);
+  if (label.length < 3 || label.split(/\s+/).length > 12 || !/[a-zà-öø-ÿ]{2}/i.test(label)) return '';
+  if (/^(?:__proto__|prototype|constructor)$/i.test(label)) return '';
+  if (/^(?:status|stato|tracking|spedizione|shipment|dettagli|details|n\/a|non disponibile|not available)$/i.test(label)) return '';
+  if (/captcha|access denied|single sign-on|\bsso\b|autenticazione|password|errore|error|non trovat|not found|riprova|try again/i.test(label)) return '';
+  return label.charAt(0).toLocaleUpperCase('it-IT') + label.slice(1);
 }
 
 function statusResult(status, detail, { evidence = 'none', confidence = 0, reasonCode = 'STATUS_UNRESOLVED', rawStatus = '', statusDateRaw = '', statusAt = '', statusDatePrecision = '' } = {}) {
@@ -95,8 +110,9 @@ export function parseRabenStatusSnapshot(snapshot) {
   ];
   for (const pattern of headlinePatterns) {
     const match = raw.match(pattern);
-    const status = match && canonicalRabenStatus(match[1]);
-    if (status) return statusResult(status, 'Stato corrente letto dal riepilogo della pagina pubblica Raben.', { evidence: 'headline', confidence: .99, reasonCode: 'STATUS_CONFIRMED', rawStatus: match[1] });
+    const canonical = match && canonicalRabenStatus(match[1]);
+    const status = canonical || (match && normalizeDiscoveredRabenStatus(match[1]));
+    if (status) return statusResult(status, canonical ? 'Stato corrente letto dal riepilogo della pagina pubblica Raben.' : 'Nuovo stato corrente scoperto nel riepilogo Raben.', { evidence: 'headline', confidence: .99, reasonCode: canonical ? 'STATUS_CONFIRMED' : 'STATUS_DISCOVERED', rawStatus: match[1] });
   }
 
   const activeLine = raw.split(/\r?\n/).find((line) => /\b(?:selected|current|active|aria-current|stato attuale|step attuale)\b/i.test(line) && canonicalRabenStatus(line));
@@ -108,8 +124,9 @@ export function parseRabenStatusSnapshot(snapshot) {
   ];
   for (const pattern of labelledPatterns) {
     const match = raw.match(pattern);
-    const status = match && canonicalRabenStatus(match[1]);
-    if (status) return statusResult(status, 'Stato corrente letto dalla pagina pubblica Raben.', { evidence: 'label', confidence: .9, reasonCode: 'STATUS_CONFIRMED', rawStatus: match[1] });
+    const canonical = match && canonicalRabenStatus(match[1]);
+    const status = canonical || (match && normalizeDiscoveredRabenStatus(match[1]));
+    if (status) return statusResult(status, canonical ? 'Stato corrente letto dalla pagina pubblica Raben.' : 'Nuovo stato corrente scoperto nel campo stato Raben.', { evidence: 'label', confidence: .9, reasonCode: canonical ? 'STATUS_CONFIRMED' : 'STATUS_DISCOVERED', rawStatus: match[1] });
   }
 
   if (!raw.includes('\n') && text.length <= 200) {
@@ -209,6 +226,10 @@ export function parseRabenDomEvidence(evidence = {}) {
     if (status) {
       return statusResult(status, 'Stato corrente letto dal riepilogo della spedizione Raben.', { evidence: 'dom-summary', confidence: .99, reasonCode: 'STATUS_CONFIRMED', rawStatus: summary });
     }
+  }
+  const discoveredStatus = normalizeDiscoveredRabenStatus(evidence.summary?.status);
+  if (discoveredStatus) {
+    return statusResult(discoveredStatus, 'Nuovo stato corrente scoperto automaticamente nel riepilogo Raben. Configura la mappatura PrestaShop nelle impostazioni.', { evidence: 'dom-summary', confidence: .99, reasonCode: 'STATUS_DISCOVERED', rawStatus: evidence.summary.status });
   }
   for (const heading of evidence.headings || []) {
     const result = parseRabenStatusSnapshot(heading);
@@ -373,7 +394,7 @@ export class RabenBetaClient {
       const statusPattern = /^(?:registrat[ao](?: a sistema)?|caricat[ao]|scaricat[ao]|in transito|in consegna|in corso(?: - parere richiesto)?|inventario a magazzino|consegnat[ao](?: con osservazioni)?|non consegnat[ao].*|non ritirat[ao].*)$/i;
       const summaryTexts = documents.flatMap((doc) => Array.from(doc.querySelectorAll('span,div,td,dd,strong')).filter((node) => node.children.length === 0).map((node) => clean(node.innerText || node.textContent)).filter((value) => statusPattern.test(value))).slice(0, 12);
       const activeSelector = '[aria-current="true"],[aria-current="step"],[aria-selected="true"],.active,.selected,.current,[class*="active"],[class*="selected"],[class*="current"]';
-      const activeTexts = documents.flatMap((doc) => Array.from(doc.querySelectorAll(activeSelector)).map((node) => clean(node.innerText || node.textContent)).filter((value) => value.length <= 160 && /registrat|caricat|scaricat|transit|consegn|deliver|inventario|parere|ritirat|loaded|exception/i.test(value))).slice(0, 20);
+      const activeTexts = documents.flatMap((doc) => Array.from(doc.querySelectorAll(activeSelector)).map((node) => clean(node.innerText || node.textContent)).filter((value) => value.length <= 160 && /registrat|caricat|scaricat|transit|consegn|deliver|inventario|in corso|parere|ritirat|loaded|exception/i.test(value))).slice(0, 20);
       const timeline = [];
       for (const doc of documents) {
         const tables = Array.from(doc.querySelectorAll('table'));

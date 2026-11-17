@@ -503,7 +503,8 @@ function normalizedStateLabel(value) {
 }
 
 function mappedPrestaShopState(row) {
-  return rabenStateMappings[row.rabenStatus] || null;
+  const mapping = rabenStateMappings[row.rabenStatus];
+  return mapping?.disabled ? null : mapping || null;
 }
 
 function isPrestaShopStateAligned(row) {
@@ -515,6 +516,7 @@ function isPrestaShopStateAligned(row) {
 
 function prestaShopStateAction(row) {
   if (row.archived) return '<span class="state-unavailable">Archiviata</span>';
+  if (rabenStateMappings[row.rabenStatus]?.disabled) return '<span class="state-unavailable">Stato disattivato</span>';
   if (isPrestaShopStateAligned(row)) return '<span class="state-aligned">Allineato</span>';
   if (!row.orderId) return `<button class="link-prestashop-order update-prestashop-state" data-tracking="${escapeHtml(row.trackingNumber)}" type="button" aria-label="Collega un ordine PrestaShop alla spedizione ${escapeHtml(row.trackingNumber)}">Collega ordine</button>`;
   const mapped = mappedPrestaShopState(row);
@@ -583,7 +585,7 @@ function renderShipmentRabenTimeline(timeline, trackingUrl) {
   return `<section class="raben-history"><div class="detail-section-heading"><h4>Storico Raben</h4><span>${countLabel}</span></div><ol class="raben-timeline">${rows}</ol></section>`;
 }
 
-const Raben_STATUS_ORDER = ['Registrata', 'Caricata', 'Prenotata', 'In transito', 'Centro di distribuzione', 'In consegna', 'Consegnata con riserva', 'Consegnata', 'Non verificato', 'Da verificare manualmente', 'Spedizione non trovata', 'Intervento manuale richiesto', 'Eccezione Raben', 'Errore verifica'];
+const Raben_STATUS_ORDER = ['Registrata', 'Caricata', 'Prenotata', 'In transito', 'Centro di distribuzione', 'In consegna', 'In corso', 'Inventario a magazzino', 'Scaricato', 'Consegnata con riserva', 'Consegnata', 'Non verificato', 'Da verificare manualmente', 'Spedizione non trovata', 'Intervento manuale richiesto', 'Eccezione Raben', 'Errore verifica'];
 
 function rabenFilterKind(status) {
   const normalized = status.toLocaleLowerCase('it-IT');
@@ -602,7 +604,7 @@ function renderRabenStatusFilters(counts = {}, archivedCount = 0, attentionTotal
   const activeStatus = $('#control-raben-filter')?.value || '';
   const exceptionActive = Boolean($('#control-exceptions')?.checked);
   const total = Object.values(counts).reduce((sum, count) => sum + Number(count || 0), 0);
-  const statuses = Object.keys(counts).filter((status) => counts[status] > 0).sort((left, right) => {
+  const statuses = Object.keys(counts).filter((status) => counts[status] > 0 && !rabenStateMappings[status]?.disabled).sort((left, right) => {
     const leftIndex = Raben_STATUS_ORDER.indexOf(left);
     const rightIndex = Raben_STATUS_ORDER.indexOf(right);
     return (leftIndex < 0 ? 999 : leftIndex) - (rightIndex < 0 ? 999 : rightIndex) || left.localeCompare(right, 'it');
@@ -636,9 +638,12 @@ function renderControlMappingAlert(counts = {}) {
     alert.innerHTML = '';
     return;
   }
-  const mappableStatuses = ['Prenotata', 'In transito', 'Centro di distribuzione', 'In consegna', 'Consegnata'];
+  const mappableStatuses = [...new Set([
+    'Prenotata', 'In transito', 'Centro di distribuzione', 'In consegna', 'In corso', 'Inventario a magazzino', 'Scaricato', 'Consegnata',
+    ...Object.keys(counts).filter((status) => rabenFilterKind(status) === 'unmapped'),
+  ])];
   const missing = mappableStatuses
-    .filter((status) => Number(counts[status] || 0) > 0 && !rabenStateMappings[status])
+    .filter((status) => Number(counts[status] || 0) > 0 && !rabenStateMappings[status]?.disabled && !rabenStateMappings[status]?.stateId)
     .map((status) => ({ status, count: Number(counts[status]) }));
   if (!missing.length) {
     alert.hidden = true;
@@ -1546,6 +1551,9 @@ const CRON_PRIORITY_DEFAULTS = Object.freeze({
   'Caricata': 'medium',
   'In transito': 'medium',
   'Centro di distribuzione': 'medium',
+  'In corso': 'medium',
+  'Inventario a magazzino': 'medium',
+  'Scaricato': 'medium',
   'Registrata': 'low',
   'Prenotata': 'low',
   'Spedizione non trovata': 'low',
@@ -2998,7 +3006,7 @@ function setupControlWorkspace() {
   card.querySelector('.control-heading > div').insertAdjacentHTML('beforeend', '<div class="control-meta"><span id="control-service-status" class="control-service-status" data-state="off">Raben tracking non attivo</span><span id="control-last-sync" class="control-last-sync" aria-live="polite"></span></div>');
   card.querySelector('.control-filters').insertAdjacentHTML('beforebegin', '<nav id="control-quick-filters" class="control-quick-filters" aria-label="Filtra per stato Raben"><span class="filter-bar-label">Stati Raben</span><button type="button" class="control-quick-filter active" data-raben-status=""><span>Tutte</span><strong>0</strong></button></nav>');
   card.querySelector('.control-filters').insertAdjacentHTML('beforebegin', '<div id="control-search-summary" class="control-search-summary" role="status" aria-live="polite" hidden></div>');
-  card.querySelector('.control-filters').insertAdjacentHTML('beforeend', '<label class="control-raben-filter-label" hidden>Stato Raben<select id="control-raben-filter"><option value="">Tutti gli esiti Raben</option><option>Registrata</option><option>Caricata</option><option>Prenotata</option><option>In transito</option><option>Centro di distribuzione</option><option>In consegna</option><option>Consegnata con riserva</option><option>Consegnata</option><option>Non verificato</option><option>Da verificare manualmente</option><option>Errore verifica</option><option>Spedizione non trovata</option><option>Intervento manuale richiesto</option><option>Eccezione Raben</option><option value="Archiviate">Archiviate</option></select></label><div class="control-filters-right"><label class="control-date-label"><span>Controllato dal</span><input id="control-date-filter" type="date"></label><button id="control-clear-filters" type="button" class="secondary control-clear-filters" hidden>Pulisci filtri</button></div>');
+  card.querySelector('.control-filters').insertAdjacentHTML('beforeend', '<label class="control-raben-filter-label" hidden>Stato Raben<select id="control-raben-filter"><option value="">Tutti gli esiti Raben</option><option>Registrata</option><option>Caricata</option><option>Prenotata</option><option>In transito</option><option>Centro di distribuzione</option><option>In consegna</option><option>In corso</option><option>Inventario a magazzino</option><option>Scaricato</option><option>Consegnata con riserva</option><option>Consegnata</option><option>Non verificato</option><option>Da verificare manualmente</option><option>Errore verifica</option><option>Spedizione non trovata</option><option>Intervento manuale richiesto</option><option>Eccezione Raben</option><option value="Archiviate">Archiviate</option></select></label><div class="control-filters-right"><label class="control-date-label"><span>Controllato dal</span><input id="control-date-filter" type="date"></label><button id="control-clear-filters" type="button" class="secondary control-clear-filters" hidden>Pulisci filtri</button></div>');
   card.querySelector('.control-filters').insertAdjacentHTML('afterend', '<div id="control-mapping-alert" class="control-mapping-alert" hidden></div>');
   card.querySelector('.control-filters').insertAdjacentHTML('afterend', '<div id="control-bulk-bar" class="control-bulk-bar" hidden><strong id="control-bulk-count">0 selezionate</strong><span>Shift + clic seleziona un intervallo</span><button id="control-bulk-verify" type="button">Verifica Raben</button><button id="control-bulk-sync-prestashop" type="button" class="secondary">Allinea stato PrestaShop</button><button id="control-bulk-sync-tracking" type="button" class="secondary"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8.5v4a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-4M8 1.5v8M5 6.5l3 3 3-3"/></svg><span>Invia tracking a PrestaShop</span></button><button id="control-bulk-export" type="button" class="secondary">Esporta CSV</button><button id="control-bulk-manage" type="button" class="secondary">Segna in lavorazione</button><button id="control-bulk-clear" type="button" class="secondary">Deseleziona</button></div>');
   $('#control-raben-filter').addEventListener('change', () => { controlPage = 1; refreshControlCenter(); });
@@ -4503,7 +4511,10 @@ async function loadStateMappings() {
     rabenStateMappings = mappingData.mappings || {};
     prestaShopStateCatalog = catalog.statuses || [];
     const observed = Object.keys(overview.rabenCounts || {});
-    const statuses = [...new Set([...Raben_STATUS_ORDER, ...observed])].sort((left, right) => {
+    const configured = Object.keys(rabenStateMappings);
+    const discoveredEntries = overview.discoveredRabenStatuses || [];
+    const discovered = discoveredEntries.map((entry) => typeof entry === 'string' ? entry : entry?.status).filter(Boolean);
+    const statuses = [...new Set([...Raben_STATUS_ORDER, ...observed, ...configured, ...discovered])].sort((left, right) => {
       const leftIndex = Raben_STATUS_ORDER.indexOf(left); const rightIndex = Raben_STATUS_ORDER.indexOf(right);
       return (leftIndex < 0 ? 999 : leftIndex) - (rightIndex < 0 ? 999 : rightIndex) || left.localeCompare(right, 'it');
     });
@@ -4511,19 +4522,25 @@ async function loadStateMappings() {
       const mapping = rabenStateMappings[status];
       const hasMapping = Boolean(mapping?.stateId);
       const isAutoSync = Boolean(mapping?.autoSync);
+      const isDisabled = Boolean(mapping?.disabled);
+      const wasDiscovered = discovered.some((item) => item.toLocaleLowerCase('it-IT') === status.toLocaleLowerCase('it-IT'));
       const options = prestaShopStateCatalog.map((state) => `<option value="${escapeHtml(state.id)}" ${String(mapping?.stateId || '') === String(state.id) ? 'selected' : ''}>${escapeHtml(state.name)}</option>`).join('');
       return `
-        <div class="state-mapping-row">
+        <div class="state-mapping-row${isDisabled ? ' is-disabled' : ''}">
           <span>
             <strong>${escapeHtml(status)}</strong>
-            <small>${Number(overview.rabenCounts?.[status] || 0)} spedizioni rilevate</small>
+            <small>${Number(overview.rabenCounts?.[status] || 0)} spedizioni rilevate${wasDiscovered ? ' · Scoperto automaticamente' : ''}</small>
+            <label class="mapping-state-active">
+              <input type="checkbox" class="raben-state-active" data-raben-status="${escapeHtml(status)}" ${isDisabled ? '' : 'checked'}>
+              <span>${isDisabled ? 'Stato disattivato' : 'Stato attivo'}</span>
+            </label>
           </span>
-          <select class="raben-mapping-select" data-raben-status="${escapeHtml(status)}" aria-label="Stato PrestaShop corrispondente a ${escapeHtml(status)}">
+          <select class="raben-mapping-select" data-raben-status="${escapeHtml(status)}" aria-label="Stato PrestaShop corrispondente a ${escapeHtml(status)}" ${isDisabled ? 'disabled' : ''}>
             <option value="">Nessuna associazione</option>
             ${options}
           </select>
           <label class="mapping-autosync-toggle" title="Se abilitato, il Cron allinea automaticamente l'ordine PrestaShop a questo stato quando Raben lo rileva">
-            <input type="checkbox" class="raben-mapping-autosync" data-raben-status="${escapeHtml(status)}" ${isAutoSync ? 'checked' : ''} ${hasMapping ? '' : 'disabled'}>
+            <input type="checkbox" class="raben-mapping-autosync" data-raben-status="${escapeHtml(status)}" ${isAutoSync && !isDisabled ? 'checked' : ''} ${hasMapping && !isDisabled ? '' : 'disabled'}>
             <span class="autosync-label-text">Auto-sync Cron</span>
           </label>
         </div>
@@ -4547,10 +4564,32 @@ async function loadStateMappings() {
       });
     });
 
+    rows.querySelectorAll('.raben-state-active').forEach((activeInput) => {
+      activeInput.addEventListener('change', () => {
+        const row = activeInput.closest('.state-mapping-row');
+        const select = row?.querySelector('.raben-mapping-select');
+        const autoSyncInput = row?.querySelector('.raben-mapping-autosync');
+        const label = activeInput.nextElementSibling;
+        const active = activeInput.checked;
+        row?.classList.toggle('is-disabled', !active);
+        if (select) select.disabled = !active;
+        if (autoSyncInput) {
+          if (!active) autoSyncInput.checked = false;
+          autoSyncInput.disabled = !active || !select?.value;
+        }
+        if (label) label.textContent = active ? 'Stato attivo' : 'Stato disattivato';
+        markSettingsDirty('mappings');
+        updateMappingFilter();
+        updateSettingsHealth();
+      });
+    });
+
     const bulkSelect = $('#mapping-bulk-state');
     if (bulkSelect) bulkSelect.innerHTML = '<option value="">Scegli stato…</option>' + prestaShopStateCatalog.map((state) => `<option value="${escapeHtml(state.id)}">${escapeHtml(state.name)}</option>`).join('');
 
-    tell('#state-mapping-message', `${Object.keys(rabenStateMappings).length} associazioni configurate.`);
+    const configuredCount = Object.values(rabenStateMappings).filter((mapping) => mapping.stateId && !mapping.disabled).length;
+    const disabledCount = Object.values(rabenStateMappings).filter((mapping) => mapping.disabled).length;
+    tell('#state-mapping-message', `${configuredCount} associazioni configurate${disabledCount ? ` · ${disabledCount} stati disattivati` : ''}.`);
     updateMappingFilter();
     updateSettingsHealth();
   } catch (error) {
@@ -4567,7 +4606,8 @@ function updateMappingFilter() {
   let incomplete = 0;
   rows.forEach((row) => {
     const select = row.querySelector('.raben-mapping-select');
-    const missing = !select?.value;
+    const stateDisabled = row.querySelector('.raben-state-active')?.checked === false;
+    const missing = !stateDisabled && !select?.value;
     if (missing) incomplete += 1;
     const matches = (!query || row.textContent.toLocaleLowerCase('it-IT').includes(query)) && (!incompleteOnly || missing);
     row.hidden = !matches;
@@ -4587,7 +4627,7 @@ function setupMappingTools() {
     const stateId = $('#mapping-bulk-state')?.value;
     if (!stateId) return;
     let changed = 0;
-    document.querySelectorAll('.state-mapping-row:not([hidden]) .raben-mapping-select').forEach((select) => {
+    document.querySelectorAll('.state-mapping-row:not([hidden]):not(.is-disabled) .raben-mapping-select').forEach((select) => {
       if (select.value !== stateId) {
         select.value = stateId;
         select.dispatchEvent(new Event('change', { bubbles: true }));
@@ -4610,11 +4650,14 @@ async function saveStateMappings(event) {
       const state = prestaShopStateCatalog?.find((item) => String(item.id) === select.value);
       const status = select.dataset.rabenStatus;
       const autoSyncCheck = document.querySelector(`.raben-mapping-autosync[data-raben-status="${CSS.escape(status)}"]`);
-      if (state) {
+      const activeCheck = document.querySelector(`.raben-state-active[data-raben-status="${CSS.escape(status)}"]`);
+      const disabled = activeCheck?.checked === false;
+      if (state || disabled) {
         mappings[status] = {
-          stateId: String(state.id),
-          stateName: state.name,
-          autoSync: Boolean(autoSyncCheck?.checked),
+          stateId: state ? String(state.id) : '',
+          stateName: state?.name || '',
+          autoSync: !disabled && Boolean(autoSyncCheck?.checked),
+          disabled,
         };
       }
     });
@@ -5123,18 +5166,23 @@ function allowShipmentDetailRefresh() {
 function renderShipmentAlignment(shipment, mappedState) {
   const aligned = isPrestaShopStateAligned(shipment);
   const hasOrder = Boolean(shipment.orderId);
+  const stateDisabled = Boolean(rabenStateMappings[shipment.rabenStatus]?.disabled);
   const eventAge = relativeAge(shipment.rabenStatusAt || shipment.rabenStatusDateRaw);
   const checkedAt = parseFlexibleDate(shipment.rabenCheckedAt || shipment.lastSeenAt);
   const isStale = Boolean(checkedAt && Date.now() - checkedAt.getTime() > 24 * 60 * 60 * 1000);
-  const resultKind = aligned ? 'aligned' : hasOrder ? 'mismatch' : 'unavailable';
-  const resultLabel = aligned ? 'Allineato' : hasOrder ? (mappedState ? 'Da aggiornare' : 'Mappatura richiesta') : 'Ordine non collegato';
-  let resultHint = aligned
+  const resultKind = stateDisabled ? 'unavailable' : aligned ? 'aligned' : hasOrder ? 'mismatch' : 'unavailable';
+  const resultLabel = stateDisabled ? 'Stato disattivato' : aligned ? 'Allineato' : hasOrder ? (mappedState ? 'Da aggiornare' : 'Mappatura richiesta') : 'Ordine non collegato';
+  let resultHint = stateDisabled
+    ? 'Nessun aggiornamento PrestaShop verrà proposto per questo stato'
+    : aligned
     ? 'Raben e PrestaShop coincidono'
     : mappedState
       ? `Stato previsto: ${mappedState.stateName}`
       : hasOrder ? 'Scegli lo stato PrestaShop corretto' : 'Nessun ordine associato alla spedizione';
   if (isStale) resultHint += ' · Verifica Raben consigliata';
-  const alignmentAction = !hasOrder
+  const alignmentAction = stateDisabled
+    ? ''
+    : !hasOrder
     ? '<button id="link-detail-prestashop-order" type="button" class="alignment-text-action">Collega ordine</button>'
     : !mappedState
       ? '<button id="configure-detail-state-mapping" type="button" class="alignment-text-action">Configura mappatura</button>'
@@ -5179,7 +5227,7 @@ async function openShipmentDetail(trackingNumber, feedback = null) {
     const trackingUrl = shipment.rabenTrackingUrl || fallbackTrackingUrl;
     const rabenTimeline = shipmentDetailTimeline(shipment);
     const mappedState = mappedPrestaShopState(shipment);
-    const canUpdateOrderState = Boolean(shipment.orderId) && !isPrestaShopStateAligned(shipment);
+    const canUpdateOrderState = Boolean(shipment.orderId) && !rabenStateMappings[shipment.rabenStatus]?.disabled && !isPrestaShopStateAligned(shipment);
     const navigation = shipmentDetailNavigation(shipment.trackingNumber);
     const checkedAge = relativeAge(shipment.rabenCheckedAt || shipment.lastSeenAt);
     const updateAction = canUpdateOrderState

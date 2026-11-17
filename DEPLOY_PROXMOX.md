@@ -260,6 +260,20 @@ cd /opt/raben-tracking-center
 bash scripts/update.sh
 ```
 
+Durante l'aggiornamento viene chiesto se aggiornare anche il **browser Camoufox**. La scelta predefinita è **No**: se l'operatore non risponde entro 30 secondi, il browser installato viene mantenuto. L'applicazione, le dipendenze Node.js e i servizi vengono comunque aggiornati e riavviati.
+
+Per gli aggiornamenti automatizzati o non interattivi è possibile decidere esplicitamente:
+
+```bash
+# Mantiene il browser Camoufox installato (scelta consigliata)
+RABEN_UPDATE_CAMOFOX=0 bash scripts/update.sh
+
+# Aggiorna anche il browser Camoufox
+RABEN_UPDATE_CAMOFOX=1 bash scripts/update.sh
+```
+
+Quando non è disponibile un terminale interattivo, lo script applica automaticamente `RABEN_UPDATE_CAMOFOX=0`.
+
 oppure passo-passo:
 
 ```bash
@@ -267,6 +281,7 @@ cd /opt/raben-tracking-center
 systemctl stop camofox raben-tracking-center
 git pull --ff-only
 npm install --omit=dev
+# Opzionale, soltanto se si desidera aggiornare anche il browser:
 CAMOUFOX_INSTALL_DIR=/opt/raben-tracking-center/.cache/camoufox npx camoufox-js fetch
 chown -R raben:raben /opt/raben-tracking-center
 systemctl daemon-reload

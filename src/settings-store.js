@@ -13,6 +13,9 @@ export const RABEN_CRON_STATE_PRIORITIES = Object.freeze({
   'Caricata': 'medium',
   'In transito': 'medium',
   'Centro di distribuzione': 'medium',
+  'In corso': 'medium',
+  'Inventario a magazzino': 'medium',
+  'Scaricato': 'medium',
   'Registrata': 'low',
   'Prenotata': 'low',
   'Spedizione non trovata': 'low',
@@ -35,7 +38,10 @@ export function normalizeRabenStateMappings(value = {}) {
     const stateId = String(target?.stateId || '').trim().slice(0, 32);
     const stateName = String(target?.stateName || '').trim().slice(0, 160);
     const autoSync = Boolean(target?.autoSync);
-    if (status && /^\d+$/.test(stateId) && stateName) mappings[status] = { stateId, stateName, autoSync };
+    const disabled = Boolean(target?.disabled);
+    if (/^(?:__proto__|prototype|constructor)$/i.test(status)) return mappings;
+    if (status && disabled) mappings[status] = { stateId: /^\d+$/.test(stateId) ? stateId : '', stateName, autoSync: false, disabled: true };
+    else if (status && /^\d+$/.test(stateId) && stateName) mappings[status] = { stateId, stateName, autoSync, disabled: false };
     return mappings;
   }, {});
 }

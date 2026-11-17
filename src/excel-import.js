@@ -28,8 +28,11 @@ export function normalizeRabenExportStatus(value) {
   if (/consegnato con osservazioni/.test(normalized)) return 'Consegnata con riserva';
   if (/^consegnat[oa]$/.test(normalized)) return 'Consegnata';
   if (/^in consegna$/.test(normalized)) return 'In consegna';
+  if (/^in corso(?:\s*-\s*parere richiesto)?$/.test(normalized)) return 'In corso';
+  if (/^inventario(?: a magazzino)?$/.test(normalized)) return 'Inventario a magazzino';
+  if (/^scaricat[oa]$/.test(normalized)) return 'Scaricato';
   if (/non consegnat|non ritirat|parere richiesto|parametri errati/.test(normalized)) return 'Eccezione Raben';
-  if (/inventario|scaricat|in corso|nuova data di consegna/.test(normalized)) return 'In transito';
+  if (/nuova data di consegna/.test(normalized)) return 'In transito';
   if (/caricat/.test(normalized)) return 'Caricata';
   if (/registrat|parametri di spedizione aggiornati/.test(normalized)) return 'Registrata';
   return raw || 'Non verificato';

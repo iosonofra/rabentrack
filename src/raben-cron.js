@@ -2,6 +2,7 @@ import { normalizeStoredRabenStatus } from './shipment-store.js';
 import { CRON_TIME_ZONE, describeCronExpression, getNextCronOccurrence, getNextCronOccurrences } from './cron-scheduler.js';
 
 const TIER_RANK = Object.freeze({ high: 1, medium: 2, low: 3 });
+const BENIGN_RABEN_REASON_CODES = new Set(['', 'STATUS_CONFIRMED', 'STATUS_INFERRED', 'STATUS_DISCOVERED', 'ALREADY_DELIVERED']);
 const FALLBACK_STATE_PRIORITIES = Object.freeze({
   'In consegna': 'high',
   'Eccezione Raben': 'high',
@@ -9,6 +10,9 @@ const FALLBACK_STATE_PRIORITIES = Object.freeze({
   'Caricata': 'medium',
   'In transito': 'medium',
   'Centro di distribuzione': 'medium',
+  'In corso': 'medium',
+  'Inventario a magazzino': 'medium',
+  'Scaricato': 'medium',
   'Registrata': 'low',
   'Prenotata': 'low',
   'Spedizione non trovata': 'low',
@@ -77,6 +81,17 @@ export function selectCronCandidates(shipments = {}, options = {}) {
   });
 
   return candidates.slice(0, batchSize);
+}
+
+export function isRabenExceptionOutcome(outcome = {}) {
+  const status = String(outcome.status || '');
+  const detail = String(outcome.detail || '');
+  const reasonCode = String(outcome.reasonCode || '');
+  return status === 'Eccezione Raben'
+    || status === 'Intervento manuale richiesto'
+    || !BENIGN_RABEN_REASON_CODES.has(reasonCode)
+    || /giacenza|fallit|mancat|rifiut/i.test(status)
+    || /giacenza|fallit|mancat|rifiut/i.test(detail);
 }
 
 export class RabenCronService {
@@ -368,7 +383,7 @@ export class RabenCronService {
 
           // 1. Auto-allineamento PrestaShop se abilitato per lo stato Raben
           const mapping = settings?.rabenStateMappings?.[latestOutcome.status];
-          if (mapping?.autoSync && mapping.stateId && candidate.orderId && this.applyOrderState && this.syncManualState) {
+          if (!mapping?.disabled && mapping?.autoSync && mapping.stateId && candidate.orderId && this.applyOrderState && this.syncManualState) {
             const currentNormalized = (candidate.currentState || '').trim().toLowerCase();
             const targetNormalized = (mapping.stateName || '').trim().toLowerCase();
             const sameId = candidate.prestaStateId && String(candidate.prestaStateId) === String(mapping.stateId);
@@ -395,11 +410,7 @@ export class RabenCronService {
           }
 
           // 2. Alert per Eccezioni e Blocchi
-          const isExceptionStatus = latestOutcome.status === 'Eccezione Raben' ||
-            latestOutcome.status === 'Intervento manuale richiesto' ||
-            Boolean(latestOutcome.reasonCode) ||
-            /giacenza|fallit|mancat|rifiut/i.test(latestOutcome.status || '') ||
-            /giacenza|fallit|mancat|rifiut/i.test(latestOutcome.detail || '');
+          const isExceptionStatus = isRabenExceptionOutcome(latestOutcome);
 
           if (isExceptionStatus && this.notificationService) {
             await this.notificationService.notifyException(candidate, latestOutcome).catch(() => {});

@@ -133,7 +133,7 @@ app.get('/api/backup/export', async (_req, res) => {
     const dateStr = new Date().toISOString().slice(0, 10);
     const payload = {
       format: 'raben-tracking-center-backup',
-      version: 2,
+      version: 3,
       exportedAt: new Date().toISOString(),
       stats: {
         shipmentsCount: shipmentsData.count,
@@ -142,6 +142,7 @@ app.get('/api/backup/export', async (_req, res) => {
       settings: settingsData,
       shipments: shipmentsData.shipments,
       operations: shipmentsData.operations,
+      discoveredRabenStatuses: shipmentsData.discoveredRabenStatuses,
     };
     const filename = `raben-backup-${dateStr}.json`;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -186,7 +187,7 @@ app.post('/api/backup/restore', upload.single('file'), async (req, res) => {
       cronService.start();
     }
 
-    const { restoredCount } = await restoreShipmentsData(shipments, payload.operations);
+    const { restoredCount } = await restoreShipmentsData(shipments, payload.operations, payload.discoveredRabenStatuses);
 
     res.json({
       success: true,
@@ -397,18 +398,25 @@ app.post('/api/raben-state-mappings', async (req, res) => {
     const states = await client().listOrderStates();
     const statesById = new Map(states.map((state) => [String(state.id), state]));
     const mappings = Object.entries(requested).reduce((output, [rabenStatus, target]) => {
+      if (target.disabled && !target.stateId) {
+        output[rabenStatus] = { stateId: '', stateName: '', autoSync: false, disabled: true };
+        return output;
+      }
       const state = statesById.get(String(target.stateId));
       if (!state) throw new Error(`Lo stato PrestaShop associato a “${rabenStatus}” non è più disponibile.`);
       output[rabenStatus] = {
         stateId: String(state.id),
         stateName: String(state.name),
-        autoSync: Boolean(target.autoSync),
+        autoSync: target.disabled ? false : Boolean(target.autoSync),
+        disabled: Boolean(target.disabled),
       };
       return output;
     }, {});
     connection = { ...connection, rabenStateMappings: mappings };
     await saveSettings(connection);
-    res.json({ mappings, message: `${Object.keys(mappings).length} associazioni salvate.` });
+    const disabledCount = Object.values(mappings).filter((mapping) => mapping.disabled).length;
+    const mappedCount = Object.values(mappings).filter((mapping) => mapping.stateId && !mapping.disabled).length;
+    res.json({ mappings, message: `${mappedCount} associazioni salvate${disabledCount ? ` · ${disabledCount} stati disattivati` : ''}.` });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
 

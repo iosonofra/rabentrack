@@ -15,9 +15,23 @@ async function load() {
   database.shipments ||= {};
   database.batches ||= [];
   database.operations ||= [];
+  database.discoveredRabenStatuses = Array.isArray(database.discoveredRabenStatuses)
+    ? database.discoveredRabenStatuses.slice(0, 200).map((entry) => ({
+      status: String(entry?.status || '').trim().slice(0, 80),
+      firstSeenAt: String(entry?.firstSeenAt || '').slice(0, 40),
+      lastSeenAt: String(entry?.lastSeenAt || '').slice(0, 40),
+      sampleTrackingNumber: String(entry?.sampleTrackingNumber || '').slice(0, 80),
+      occurrences: Math.max(1, Number(entry?.occurrences) || 1),
+    })).filter((entry) => entry.status)
+    : [];
   let migrated = false;
   for (const record of Object.values(database.shipments)) {
-    const normalizedStatus = normalizeStoredRabenStatus(record.rabenStatus);
+    const storedStatus = normalizeStoredRabenStatus(record.rabenStatus);
+    const recoveredRawStatus = normalizeStoredRabenStatus(record.rabenRawStatus);
+    const normalizedStatus = ['In transito', 'Eccezione Raben'].includes(storedStatus)
+      && ['In corso', 'Inventario a magazzino', 'Scaricato'].includes(recoveredRawStatus)
+      ? recoveredRawStatus
+      : storedStatus;
     if (record.rabenStatus !== normalizedStatus) {
       record.rabenStatus = normalizedStatus;
       migrated = true;
@@ -57,6 +71,9 @@ export function normalizeStoredRabenStatus(value) {
   if (/^consegnata con riserva$|^consegnato con osservazioni$/.test(normalized)) return 'Consegnata con riserva';
   if (/^consegnat[oa]$|^delivered$/.test(normalized)) return 'Consegnata';
   if (/^in consegna$|^out for delivery$/.test(normalized)) return 'In consegna';
+  if (/^in corso(?:\s*-\s*parere richiesto)?$/.test(normalized)) return 'In corso';
+  if (/^inventario(?: a magazzino)?$/.test(normalized)) return 'Inventario a magazzino';
+  if (/^scaricat[oa]$/.test(normalized)) return 'Scaricato';
   if (/^consegnat[oa] al terminal$|terminal dal mittente/.test(normalized)) return 'Prenotata';
   if (/^partit[oa]$|^departed$/.test(normalized)) return 'In transito';
   if (/centro di distribuzione|distribution cent(?:er|re)/.test(normalized)) return 'Centro di distribuzione';
@@ -275,6 +292,29 @@ export async function syncRabenShipments(results) {
     record.rabenCheckedAt = now();
     record.lastSeenAt = now();
     addEvent(record, 'raben', result.status, result.detail || '');
+    if (result.reasonCode === 'STATUS_DISCOVERED' && nextRabenStatus) {
+      const discovered = db.discoveredRabenStatuses.find((entry) => entry.status.toLocaleLowerCase('it-IT') === nextRabenStatus.toLocaleLowerCase('it-IT'));
+      if (discovered) {
+        discovered.lastSeenAt = now();
+        discovered.sampleTrackingNumber = result.trackingNumber;
+        discovered.occurrences = Math.max(1, Number(discovered.occurrences) || 1) + 1;
+      } else {
+        const detectedAt = now();
+        db.discoveredRabenStatuses.push({ status: nextRabenStatus, firstSeenAt: detectedAt, lastSeenAt: detectedAt, sampleTrackingNumber: result.trackingNumber, occurrences: 1 });
+        db.discoveredRabenStatuses = db.discoveredRabenStatuses.slice(-200);
+        db.operations ||= [];
+        db.operations.unshift({
+          id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          at: detectedAt,
+          scope: 'raben',
+          level: 'warning',
+          action: 'Nuovo stato Raben rilevato',
+          detail: `Rilevato “${nextRabenStatus}” sul tracking ${result.trackingNumber}. Lo stato è disponibile nella mappatura PrestaShop.`,
+          metadata: { trackingNumber: result.trackingNumber, rabenStatus: nextRabenStatus },
+        });
+        db.operations = db.operations.slice(0, 200);
+      }
+    }
   }
   await persist();
 }
@@ -459,6 +499,7 @@ export async function getControlCenter({ query = '', status = '', rabenStatus = 
     totalPages,
     checkSort: sortDirection,
     records: filtered.slice(offset, offset + normalizedPageSize),
+    discoveredRabenStatuses: (db.discoveredRabenStatuses || []).map((entry) => ({ ...entry })),
   };
 }
 
@@ -523,10 +564,11 @@ export async function exportShipmentsData() {
     count: Object.keys(db.shipments || {}).length,
     shipments: db.shipments || {},
     operations: db.operations || [],
+    discoveredRabenStatuses: db.discoveredRabenStatuses || [],
   };
 }
 
-export async function restoreShipmentsData(importedShipments, importedOperations = null) {
+export async function restoreShipmentsData(importedShipments, importedOperations = null, importedDiscoveredStatuses = null) {
   if (!importedShipments || typeof importedShipments !== 'object' || Array.isArray(importedShipments)) {
     throw new Error('Dati spedizioni non validi per il ripristino.');
   }
@@ -551,6 +593,15 @@ export async function restoreShipmentsData(importedShipments, importedOperations
         metadata: operation?.metadata && typeof operation.metadata === 'object' && !Array.isArray(operation.metadata) ? operation.metadata : {},
       }))
       : (database?.operations || []),
+    discoveredRabenStatuses: Array.isArray(importedDiscoveredStatuses)
+      ? importedDiscoveredStatuses.slice(0, 200).map((entry) => ({
+        status: String(entry?.status || '').trim().slice(0, 80),
+        firstSeenAt: String(entry?.firstSeenAt || '').slice(0, 40),
+        lastSeenAt: String(entry?.lastSeenAt || '').slice(0, 40),
+        sampleTrackingNumber: String(entry?.sampleTrackingNumber || '').slice(0, 80),
+        occurrences: Math.max(1, Number(entry?.occurrences) || 1),
+      })).filter((entry) => entry.status)
+      : (database?.discoveredRabenStatuses || []),
   };
   await persist();
   return {
