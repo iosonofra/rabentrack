@@ -977,6 +977,7 @@ function updateControlRabenProgress(progress, context = {}) {
   const jobState = context.jobStatus || progress.phase || 'running';
   const fallbackActive = Boolean(progress.fallbackReason) || normalizeUiRabenSpeedProfile(progress.requestedSpeedProfile) !== normalizeUiRabenSpeedProfile(progress.effectiveSpeedProfile);
   const phaseLabels = {
+    'browser-waiting': 'In attesa del browser · verifica corrente in corso',
     queued: 'In coda: attesa disponibilità Camoufox',
     preparing: 'Preparazione browser Camoufox',
     checking: 'Lettura stato dalla pagina Raben',
@@ -1024,7 +1025,7 @@ function updateControlRabenProgress(progress, context = {}) {
 
   const eta = $('#control-raben-progress-eta');
   eta.textContent = remainingMs ? `Circa ${formatControlProgressDuration(remainingMs)} rimanenti` : 'Calcolo della stima…';
-  eta.hidden = jobState === 'queued' || completed >= total || ['cancelled', 'failed'].includes(jobState);
+  eta.hidden = jobState === 'queued' || progress.phase === 'browser-waiting' || completed >= total || ['cancelled', 'failed'].includes(jobState);
 
   const counts = $('#control-raben-progress-counts');
   counts.textContent = `${cachedCount} da cache · ${errorCount} errori`;
@@ -1540,8 +1541,11 @@ function setupBackupRestore() {
 }
 
 let cronPollingTimer = null;
+let cronStatusRequest = null;
+let cronStatusAbort = null;
 let cronLastIsRunning = false;
 let cronPreviewTimer = null;
+let cronPreviewAbort = null;
 let cronStatePriorities = {};
 
 const CRON_PRIORITY_DEFAULTS = Object.freeze({
@@ -1609,6 +1613,8 @@ function updateCronScheduleMode() {
 }
 
 async function previewCronSchedule() {
+  cronPreviewAbort?.abort();
+  const controller = cronPreviewAbort = new AbortController();
   const input = $('#cron-expression');
   const output = $('#cron-expression-preview');
   if (!input || !output) return;
@@ -1621,13 +1627,15 @@ async function previewCronSchedule() {
   output.className = 'cron-expression-preview loading';
   output.innerHTML = '<strong>Verifica pianificazione…</strong>';
   try {
-    const preview = await request(`/api/cron/preview?expression=${encodeURIComponent(expression)}&timeZone=Europe%2FRome`);
+    const preview = await request(`/api/cron/preview?expression=${encodeURIComponent(expression)}&timeZone=Europe%2FRome`, { signal: controller.signal });
+    if (controller.signal.aborted || input.value.trim() !== expression) return;
     output.className = 'cron-expression-preview success';
     output.innerHTML = `<strong>${escapeHtml(preview.description)}</strong><span>Prossimi avvii: ${preview.nextRuns.map(displayDateTime).map(escapeHtml).join(' · ')}</span>`;
   } catch (error) {
+    if (controller.signal.aborted || input.value.trim() !== expression) return;
     output.className = 'cron-expression-preview error';
     output.innerHTML = `<strong>Espressione non valida</strong><span>${escapeHtml(error.message)}</span>`;
-  }
+  } finally { if (cronPreviewAbort === controller) cronPreviewAbort = null; }
 }
 
 async function loadCronPresets() {
@@ -1642,14 +1650,51 @@ async function loadCronPresets() {
   }
 }
 
-async function loadCronStatus() {
-  try {
-    const status = await request('/api/cron/status');
-    renderCronStatus(status);
-  } catch (err) {
-    console.error('[CRON] Errore caricamento stato cron:', err);
-  }
+function scheduleCronPolling() {
+  if (cronPollingTimer) clearTimeout(cronPollingTimer);
+  cronPollingTimer = null;
+  if (document.hidden || !cronLastIsRunning || cronStatusRequest) return;
+  cronPollingTimer = setTimeout(() => {
+    cronPollingTimer = null;
+    void loadCronStatus();
+  }, 2000);
 }
+
+function loadCronStatus() {
+  if (document.hidden) return Promise.resolve();
+  if (cronStatusRequest) return cronStatusRequest;
+  if (cronPollingTimer) clearTimeout(cronPollingTimer);
+  cronPollingTimer = null;
+  const controller = new AbortController();
+  cronStatusAbort = controller;
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  cronStatusRequest = (async () => {
+    try {
+      const status = await request('/api/cron/status', { signal: controller.signal });
+      if (!controller.signal.aborted && !document.hidden) renderCronStatus(status);
+    } catch (err) {
+      if (err.name !== 'AbortError') console.error('[CRON] Errore caricamento stato cron:', err);
+    } finally {
+      clearTimeout(timeout);
+      cronStatusAbort = null;
+      cronStatusRequest = null;
+      scheduleCronPolling();
+    }
+  })();
+  return cronStatusRequest;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (cronPollingTimer) clearTimeout(cronPollingTimer);
+    cronPollingTimer = null;
+    cronStatusAbort?.abort();
+  } else {
+    const pending = cronStatusRequest;
+    if (pending) void pending.finally(() => { if (!document.hidden) void loadCronStatus(); });
+    else void loadCronStatus();
+  }
+});
 
 async function loadCronOperationLog() {
   const list = $('#cron-operation-log');
@@ -1797,26 +1842,27 @@ function renderCronStatus(status) {
 
     if (pctEl) pctEl.textContent = `${pct}% (${completed}/${total})`;
     if (barEl) barEl.style.width = `${pct}%`;
-    if (detailEl) detailEl.textContent = `Controllo spedizione: ${escapeHtml(progress.currentTracking || '—')} (${completed + 1} di ${total})…`;
+    if (detailEl) detailEl.textContent = progress.phase === 'browser-waiting'
+      ? `In attesa del browser · spedizione ${progress.currentTracking || '—'} (${completed + 1} di ${total})`
+      : `Controllo spedizione: ${progress.currentTracking || '—'} (${completed + 1} di ${total})…`;
 
-    if (!cronPollingTimer) {
-      cronPollingTimer = setInterval(loadCronStatus, 2000);
-    }
   } else {
     if (activeBox) activeBox.hidden = true;
     if (cronPollingTimer) {
-      clearInterval(cronPollingTimer);
+      clearTimeout(cronPollingTimer);
       cronPollingTimer = null;
     }
 
     if (cronLastIsRunning && !status.isRunning) {
-      showFloatingToast('Controllo periodico completato con successo!', 'success');
+      const interrupted = ['cancelled', 'timed-out'].includes(status.lastRunSummary?.type);
+      showFloatingToast(interrupted ? (status.lastRunSummary?.reason || 'Controllo periodico interrotto.') : 'Controllo periodico completato.', interrupted ? 'warning' : 'success');
       void refreshControlCenter();
       void loadCronOperationLog();
     }
   }
 
   cronLastIsRunning = Boolean(status.isRunning);
+  scheduleCronPolling();
   updateSettingsHealth();
   updateCronImpactPreview();
 
@@ -1834,7 +1880,7 @@ function renderCronStatus(status) {
       const errorsText = s.errors > 0
         ? `<span style="color:var(--danger)"> · ${s.errors} con errore</span>`
         : '';
-      const cancelledText = s.type === 'cancelled' ? ' <span style="color:var(--warning)">(Interrotta dall’operatore)</span>' : '';
+      const cancelledText = ['cancelled', 'timed-out'].includes(s.type) ? ` <span style="color:var(--warning)">(${escapeHtml(s.reason || 'Interrotta dall’operatore')})</span>` : '';
       const profileText = rabenSpeedLabel(s.effectiveSpeedProfile);
       const fallbackText = s.fallbackReason ? `<li class="cron-profile-fallback">${escapeHtml(s.fallbackReason)}</li>` : '';
 
@@ -1991,9 +2037,6 @@ function setupCronSection() {
       showFloatingToast('Controllo manuale avviato in background!', 'success');
       renderCronStatus(res.status);
       void loadCronOperationLog();
-      if (!cronPollingTimer) {
-        cronPollingTimer = setInterval(loadCronStatus, 2000);
-      }
     } catch (err) {
       alert(`Impossibile avviare il controllo: ${err.message}`);
       triggerBtn.disabled = false;
@@ -2447,7 +2490,7 @@ function setupWorkspace() {
             <input id="trigger-sla" type="checkbox" checked>
             <div>
               <strong>Allarme SLA (Spedizioni ferme da &gt; 48h)</strong>
-              <span>Segnala le spedizioni in viaggio o in transito che non registrano avanzamenti da oltre 48 ore.</span>
+              <span>Conta le ore dall’ultimo evento Raben, non dall’ultimo controllo. Spedizioni concluse, date mancanti o future sono escluse.</span>
             </div>
           </label>
           <label class="trigger-checkbox-row">
@@ -2469,8 +2512,11 @@ function setupWorkspace() {
               <input id="trigger-digest-hour" type="number" min="0" max="23" value="8" style="width:55px;"> :
               <input id="trigger-digest-minute" type="number" min="0" max="59" value="30" style="width:55px;">
             </label>
-            <button id="trigger-digest-test-btn" type="button" class="secondary" title="Invia subito il digest di prova">Invia digest adesso</button>
+            <button id="trigger-digest-test-btn" type="button" class="secondary" title="Accoda il riepilogo di oggi; non viene duplicato se già accodato">Accoda riepilogo di oggi</button>
           </div>
+          <p class="muted">Orari Europe/Rome. Con il cron attivo, SLA e riepiloghi vengono controllati ogni minuto, anche durante la pausa delle scansioni. Al riavvio viene valutato solo oggi.</p>
+          <button id="notification-preview-btn" type="button" class="secondary">Anteprima senza invio</button>
+          <div id="notification-preview" role="status" aria-live="polite"></div>
         </div>
       </div>
 
@@ -2479,6 +2525,14 @@ function setupWorkspace() {
         <button id="save-notifications-btn" type="submit">Salva impostazioni notifiche</button>
       </div>
     </form>
+    <section class="notification-outbox" aria-labelledby="notification-outbox-heading">
+      <div class="notification-outbox-toolbar"><h3 id="notification-outbox-heading">Coda e ultimi invii</h3><button type="button" id="refresh-notification-outbox" class="secondary">Aggiorna invii</button></div>
+      <p>Le notifiche operative vengono salvate prima dell’invio. I messaggi con consegna incerta richiedono una verifica prima di riprovare.</p>
+      <p id="notification-outbox-summary" aria-live="polite">Caricamento degli invii…</p>
+      <div class="table-wrap"><table id="notification-outbox-table" aria-label="Coda notifiche e ultimi invii"><thead><tr><th scope="col">Notifica</th><th scope="col">Canale</th><th scope="col">Stato</th><th scope="col">Tentativi</th><th scope="col">Azioni</th></tr></thead><tbody id="notification-outbox-list"><tr><td colspan="5">Caricamento…</td></tr></tbody></table></div>
+      <p id="notification-outbox-message" class="message" role="status"></p>
+      <small>Fino a 50 notifiche, con problemi e attese in evidenza. Gli esiti vengono conservati per 7 giorni.</small>
+    </section>
   `;
 
   const settingsDashboard = document.createElement('div');
@@ -2543,7 +2597,7 @@ function setupWorkspace() {
     const cronForm = $('#cron-config-form');
     const scheduleTitle = document.createElement('div');
     scheduleTitle.className = 'cron-panel-heading';
-    scheduleTitle.innerHTML = '<h3>Pianificazione</h3><p>Scegli un intervallo semplice oppure orari precisi nel fuso Europe/Rome.</p>';
+    scheduleTitle.innerHTML = '<h3>Pianificazione</h3><p>Orari Europe/Rome. La pausa impedisce nuovi cicli a intervallo; quelli già avviati terminano. Il calendario cron segue soltanto l’espressione. Al riavvio gli avvii persi vengono saltati.</p>';
     cronForm?.prepend(scheduleTitle);
     const cronFields = cronForm?.querySelector('.cron-fields');
     const intervalLabel = $('#cron-interval')?.closest('label');
@@ -2552,7 +2606,7 @@ function setupWorkspace() {
     if (legacyMinIntervalLabel) legacyMinIntervalLabel.hidden = true;
     scheduleTitle.insertAdjacentHTML('afterend', `
       <div class="cron-mode-selector" role="radiogroup" aria-label="Modalità di pianificazione">
-        <label><input type="radio" name="cron-schedule-mode" value="interval" checked><span><strong>Intervallo periodico</strong><small>Ogni numero definito di minuti</small></span></label>
+        <label><input type="radio" name="cron-schedule-mode" value="interval" checked><span><strong>Intervallo periodico</strong><small>Minuti dalla fine del ciclo precedente</small></span></label>
         <label><input type="radio" name="cron-schedule-mode" value="cron"><span><strong>Orari specifici</strong><small>Calendario cron in ora italiana</small></span></label>
       </div>
     `);
@@ -4673,6 +4727,7 @@ async function saveStateMappings(event) {
 }
 
 async function loadNotificationSettings() {
+  void loadNotificationOutbox();
   try {
     const data = await request('/api/notifications/config');
     const n = data.notifications || {};
@@ -4705,7 +4760,53 @@ async function loadNotificationSettings() {
   }
 }
 
+let notificationOutboxEntries = new Map();
+let notificationOutboxLoading = false;
+async function loadNotificationOutbox() {
+  const list = $('#notification-outbox-list');
+  const summary = $('#notification-outbox-summary');
+  const button = $('#refresh-notification-outbox');
+  if (!list || notificationOutboxLoading) return;
+  notificationOutboxLoading = true;
+  list.setAttribute('aria-busy', 'true');
+  if (button) button.disabled = true;
+  const labels = { pending: 'In coda', sending: 'Invio in corso', retry: 'Nuovo tentativo previsto', paused: 'Sospesa', sent: 'Inviata', failed: 'Non inviata', uncertain: 'Consegna da verificare', expired: 'Scaduta', cancelled: 'Annullata' };
+  try {
+    const data = await request('/api/notifications/outbox?limit=50');
+    notificationOutboxEntries = new Map(data.entries.map((entry) => [entry.id, entry]));
+    const counts = data.counts || {};
+    summary.textContent = data.available
+      ? `${(counts.pending || 0) + (counts.retry || 0)} in attesa · ${counts.sending || 0} in invio · ${counts.sent || 0} inviate · ${(counts.failed || 0) + (counts.uncertain || 0) + (counts.paused || 0)} da controllare`
+      : `Invii sospesi: ${data.storageError || 'coda non disponibile'}. Controlla il servizio prima di riprovare.`;
+    list.innerHTML = data.entries.length ? data.entries.map((entry) => `<tr><td><strong>${escapeHtml(entry.label)}</strong><small>${displayDateTime(new Date(entry.createdAt).toISOString())}</small>${entry.lastError ? `<small class="notification-outbox-error">${escapeHtml(entry.lastError)}</small>` : ''}</td><td>${entry.channel === 'email' ? 'Email' : 'Telegram'}</td><td><span class="notification-outbox-status" data-status="${escapeHtml(entry.status)}">${escapeHtml(labels[entry.status] || entry.status)}</span>${entry.status === 'retry' ? `<small>${displayDateTime(new Date(entry.nextAttemptAt).toISOString())}</small>` : ''}</td><td>${Number(entry.attempts) || 0} / 3</td><td>${entry.canRetry && data.available ? `<button type="button" class="secondary" data-notification-action="retry" data-notification-id="${escapeHtml(entry.id)}">${entry.status === 'uncertain' ? 'Verifica e riprova' : 'Riprova invio'}</button>` : ''}${entry.canDiscard && data.available ? `<button type="button" class="secondary" data-notification-action="discard" data-notification-id="${escapeHtml(entry.id)}">Annulla invio</button>` : ''}${!entry.canRetry && !entry.canDiscard ? '—' : ''}</td></tr>`).join('') : '<tr><td colspan="5">Nessuna notifica operativa registrata. I test di connessione vengono inviati direttamente e non compaiono qui.</td></tr>';
+  } catch (error) {
+    summary.textContent = `Impossibile caricare gli invii: ${error.message}. Usa Aggiorna invii per riprovare.`;
+  } finally {
+    notificationOutboxLoading = false;
+    list.removeAttribute('aria-busy');
+    if (button) button.disabled = false;
+  }
+}
+
 function setupNotificationSection() {
+  $('#refresh-notification-outbox')?.addEventListener('click', () => { void loadNotificationOutbox(); });
+  $('#notification-outbox-list')?.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-notification-action]');
+    if (!button) return;
+    const entry = notificationOutboxEntries.get(button.dataset.notificationId);
+    if (!entry) return;
+    const action = button.dataset.notificationAction;
+    const confirmUncertain = entry.status === 'uncertain';
+    if (action === 'retry' && confirmUncertain && !confirm('La consegna non è confermata: il messaggio potrebbe essere già arrivato. Vuoi riprovare accettando il rischio di un duplicato?')) return;
+    if (action === 'discard' && !confirm('Annullare questa notifica? Non verrà più inviata automaticamente.')) return;
+    button.disabled = true;
+    try {
+      const result = await request(`/api/notifications/outbox/${encodeURIComponent(entry.id)}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmUncertain }) });
+      tell('#notification-outbox-message', result.message, 'success');
+      await loadNotificationOutbox();
+    } catch (error) { tell('#notification-outbox-message', error.message, 'error'); }
+    finally { button.disabled = false; }
+  });
   const form = $('#notification-config-form');
   const msg = $('#notification-config-message');
   const saveBtn = $('#save-notifications-btn');
@@ -4740,8 +4841,8 @@ function setupNotificationSection() {
           sla48h: $('#trigger-sla')?.checked,
           autoSyncSuccess: $('#trigger-autosync')?.checked,
           dailyDigest: $('#trigger-digest')?.checked,
-          digestHour: Number($('#trigger-digest-hour')?.value) || 8,
-          digestMinute: Number($('#trigger-digest-minute')?.value) || 30,
+          digestHour: Number($('#trigger-digest-hour')?.value ?? 8),
+          digestMinute: Number($('#trigger-digest-minute')?.value ?? 30),
         },
       };
 
@@ -4753,6 +4854,7 @@ function setupNotificationSection() {
 
       if (msg) { msg.className = 'message success'; msg.textContent = res.message || 'Impostazioni salvate con successo!'; }
       showFloatingToast('Impostazioni notifiche salvate!', 'success');
+      void loadNotificationOutbox();
       markSettingsClean('notifications');
       updateSettingsHealth();
     } catch (err) {
@@ -4824,13 +4926,31 @@ function setupNotificationSection() {
     try {
       const res = await request('/api/notifications/trigger-digest', { method: 'POST' });
       showFloatingToast(res.message || 'Digest inviato!', 'success');
-      setSettingsTestResult('notifications', true, `${res.message || 'Digest di prova inviato'} · ${settingsTimestamp()}`);
+      void loadNotificationOutbox();
     } catch (err) {
       setSettingsTestResult('notifications', false, `Digest: ${err.message}`);
     } finally {
       testDigestBtn.disabled = false;
       testDigestBtn.textContent = orig;
     }
+  });
+  const previewBtn = $('#notification-preview-btn');
+  previewBtn?.addEventListener('click', async () => {
+    const output = $('#notification-preview');
+    previewBtn.disabled = true;
+    previewBtn.setAttribute('aria-busy', 'true');
+    output.textContent = 'Calcolo dei conteggi in corso…';
+    try {
+      const summary = await request('/api/notifications/preview');
+      output.innerHTML = `<p><strong>Anteprima del ${escapeHtml(summary.day)} · Europe/Rome</strong><br>
+        ${Number(summary.totalActive)} attive · ${Number(summary.deliveredToday)} consegnate oggi · ${Number(summary.exceptions)} eccezioni aperte.<br>
+        <strong>${Number(summary.delayed)} ferme da oltre 48 ore</strong> (prima: ${Number(summary.legacyDelayed)}; ${Number(summary.newlyDelayed)} aggiunte, ${Number(summary.noLongerDelayed)} escluse).<br>
+        Date evento mancanti: ${Number(summary.missingEventDate)} · future: ${Number(summary.futureEventDate)}. Escluse dallo SLA.<br>
+        Consegne senza data: ${Number(summary.missingDeliveryDate)}. Escluse dalle consegne di oggi.</p>
+        ${summary.delayedExamples?.length ? `<p>Esempi SLA: ${summary.delayedExamples.map((item) => escapeHtml(item.trackingNumber)).join(', ')}.</p>` : ''}
+        <p>Nessun messaggio è stato accodato o inviato. I conteggi usano i dati salvati e le regole del sistema.</p>`;
+    } catch (error) { output.textContent = `Anteprima non disponibile: ${error.message}`; }
+    finally { previewBtn.disabled = false; previewBtn.removeAttribute('aria-busy'); }
   });
 }
 

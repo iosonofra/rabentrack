@@ -1,3 +1,5 @@
+import { deadline, pause, RequestGate } from './operation-control.js';
+
 function trimSlash(value) {
   return value.replace(/\/$/, '');
 }
@@ -8,32 +10,14 @@ const WRITE_CONFIRMATION_DELAY_MS = 650;
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const RETRYABLE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-class RequestGate {
-  constructor(intervalMs) {
-    this.intervalMs = intervalMs;
-    this.nextAvailableAt = 0;
-    this.chain = Promise.resolve();
-  }
-
-  run(work) {
-    const scheduled = this.chain.then(async () => {
-      const waitMs = Math.max(0, this.nextAvailableAt - Date.now());
-      if (waitMs) await delay(waitMs);
-      this.nextAvailableAt = Date.now() + this.intervalMs;
-      return work();
-    });
-    this.chain = scheduled.catch(() => {});
-    return scheduled;
-  }
-}
-
 const requestGate = new RequestGate(REQUEST_INTERVAL_MS);
-const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const delay = pause;
 
 export class PrestaShopClient {
-  constructor({ baseUrl, apiKey }) {
+  constructor({ baseUrl, apiKey, signal, requestTimeoutMs = 30000, queueTimeoutMs = 120000, fetchFn = globalThis.fetch, gate = requestGate, retryDelayMs = 1000 }) {
     this.baseUrl = trimSlash(baseUrl);
     this.apiKey = apiKey;
+    Object.assign(this, { signal, requestTimeoutMs, queueTimeoutMs, fetchFn, gate, retryDelayMs });
   }
 
   async request(resource, options = {}) {
@@ -53,14 +37,29 @@ export class PrestaShopClient {
     let lastError;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
-        const response = await requestGate.run(() => fetch(url, options));
+        const signal = options?.signal && this.signal ? AbortSignal.any([options.signal, this.signal]) : options?.signal || this.signal;
+        const response = await this.gate.run(async () => {
+          const budget = deadline(this.requestTimeoutMs, signal, 'PrestaShop non ha completato la richiesta entro il tempo massimo.');
+          try {
+            const response = await this.fetchFn(url, { ...options, signal: budget.signal });
+            // Keep the gate and deadline until the entire body is consumed.
+            const body = await response.text();
+            return new Response([204, 205, 304].includes(response.status) || method === 'HEAD' ? null : body, { status: response.status, statusText: response.statusText, headers: response.headers });
+          } catch (error) {
+            if (!RETRYABLE_METHODS.has(method)) {
+              throw Object.assign(new Error('Esito scrittura PrestaShop non confermato: verificare lo stato prima di riprovare.', { cause: error }), { code: 'WRITE_OUTCOME_UNKNOWN' });
+            }
+            throw error;
+          } finally { budget.dispose(); }
+        }, { signal, waitTimeoutMs: this.queueTimeoutMs });
         if (!RETRYABLE_STATUSES.has(response.status) || attempt === maxAttempts - 1) return response;
         lastError = new Error(`PrestaShop ha risposto ${response.status}`);
       } catch (error) {
         lastError = error;
+        if (this.signal?.aborted || options?.signal?.aborted) throw error;
         if (attempt === maxAttempts - 1) throw error;
       }
-      await delay(1000 * (attempt + 1));
+      await delay(this.retryDelayMs * (attempt + 1), this.signal || options?.signal);
     }
     throw lastError;
   }
@@ -421,7 +420,7 @@ export class PrestaShopClient {
       // PrestaShop può salvare la risorsa e rispondere comunque 400. Non
       // ripetiamo qui la PUT: attendiamo che API/cache espongano il dato.
       for (let attempt = 0; attempt < WRITE_CONFIRMATION_ATTEMPTS; attempt += 1) {
-        if (attempt) await delay(WRITE_CONFIRMATION_DELAY_MS);
+        if (attempt) await delay(WRITE_CONFIRMATION_DELAY_MS, this.signal);
         try {
           const refreshedShipments = await this.findOrderCarriers(orderId);
           const refreshed = refreshedShipments.find((candidate) => String(candidate.id) === String(shipment.id));

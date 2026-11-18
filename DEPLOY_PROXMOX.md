@@ -115,7 +115,7 @@ ENABLE_CAMOFOX=false bash scripts/setup-debian.sh
 
 Lo script installa:
 
-- Node.js 22 LTS; il progetto richiede almeno Node.js 20;
+- Node.js 22 LTS; il progetto richiede almeno Node.js 20.10 per il flush dei file;
 - librerie GTK, NSS, X11, audio, D-Bus e font richieste dal browser;
 - Xvfb per l'esecuzione headless;
 - strumenti di compilazione `python3` e `build-essential`, necessari quando un modulo Node.js nativo come `better-sqlite3` non dispone di un binario precompilato;
@@ -409,7 +409,7 @@ Se compare un evento OOM, portare la RAM del container ad almeno 2 GB e aumentar
 ## Checklist finale
 
 - [ ] Container LXC basato su Debian 12.
-- [ ] Node.js 20 o successivo.
+- [ ] Node.js 22 LTS installato (minimo supportato 20.10).
 - [ ] `raben-tracking-center` attivo e abilitato al boot.
 - [ ] `camofox` attivo e abilitato al boot.
 - [ ] `curl http://127.0.0.1:9377/health` riuscito.

@@ -1,5 +1,10 @@
 import { normalizeStoredRabenStatus } from './shipment-store.js';
-import { CRON_TIME_ZONE, describeCronExpression, getNextCronOccurrence, getNextCronOccurrences } from './cron-scheduler.js';
+import { CRON_TIME_ZONE, describeCronExpression } from './cron-scheduler.js';
+import { cronCalculator } from './cron-calculator.js';
+import { deadline, pause } from './operation-control.js';
+import { buildNotificationSummary } from './raben-notification-summary.js';
+import { romeDay, romeParts } from './raben-event-time.js';
+import { channelIdentity } from './notification-outbox.js';
 
 const TIER_RANK = Object.freeze({ high: 1, medium: 2, low: 3 });
 const BENIGN_RABEN_REASON_CODES = new Set(['', 'STATUS_CONFIRMED', 'STATUS_INFERRED', 'STATUS_DISCOVERED', 'ALREADY_DELIVERED']);
@@ -107,6 +112,7 @@ export class RabenCronService {
     recordOperation,
     logger = console,
     jitterFn = () => 4000 + Math.floor(Math.random() * 2000),
+    cycleTimeoutMs,
   }) {
     this.getSettings = getSettings;
     this.saveSettings = saveSettings;
@@ -119,8 +125,11 @@ export class RabenCronService {
     this.recordOperation = recordOperation;
     this.logger = logger;
     this.jitterFn = jitterFn;
+    this.cycleTimeoutMs = cycleTimeoutMs;
 
     this.timer = null;
+    this.scheduleGeneration = 0;
+    this.scheduleError = '';
     this.isRunning = false;
     this.cancelRequested = false;
     this.lastRunAt = null;
@@ -128,8 +137,13 @@ export class RabenCronService {
     this.upcomingRuns = [];
     this.lastRunSummary = null;
     this.activeProgress = null;
-    this.lastSlaCheckAt = 0;
-    this.lastDigestSentDate = null;
+    this.lastSlaContext = null;
+    this.lastDigestContext = null;
+    this.notificationTimer = null;
+    this.notificationGeneration = 0;
+    this.notificationEvaluation = null;
+    this.previewPromise = null;
+    this.lastNotificationCheck = null;
   }
 
   async addOperation(action, detail = '', level = 'info', metadata = {}) {
@@ -141,7 +155,16 @@ export class RabenCronService {
     }
   }
 
-  start() {
+  async queueNotification(work) {
+    try { return await work(); }
+    catch (error) {
+      this.logger.error('[Raben-CRON] Notifica non accodata:', error.message);
+      await this.addOperation('Notifica non accodata', error.message, 'error');
+      return { queued: false, error: error.message };
+    }
+  }
+
+  async start(precomputed) {
     this.stop();
     const settings = this.getSettings();
     const config = settings?.cron;
@@ -149,7 +172,8 @@ export class RabenCronService {
       this.nextRunAt = null;
       return;
     }
-    this.scheduleNextRun();
+    this.startNotificationChecks();
+    await this.scheduleNextRun(new Date(), precomputed);
     const scheduleLabel = config.scheduleMode === 'cron'
       ? describeCronExpression(config.cronExpression)
       : `ogni ${config.intervalMinutes} minuti`;
@@ -157,6 +181,11 @@ export class RabenCronService {
   }
 
   stop() {
+    this.notificationGeneration += 1;
+    if (this.notificationTimer) clearTimeout(this.notificationTimer);
+    this.notificationTimer = null;
+    this.notificationController?.abort();
+    this.scheduleGeneration += 1;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -165,7 +194,10 @@ export class RabenCronService {
     this.upcomingRuns = [];
   }
 
-  scheduleNextRun(fromDate = new Date()) {
+  async scheduleNextRun(fromDate = new Date(), precomputed) {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    const generation = ++this.scheduleGeneration;
     const config = this.getSettings()?.cron || {};
     if (!config.enabled) {
       this.nextRunAt = null;
@@ -173,17 +205,32 @@ export class RabenCronService {
       return;
     }
     if (config.scheduleMode === 'cron') {
-      this.upcomingRuns = getNextCronOccurrences(config.cronExpression, fromDate, 5, config.timeZone || CRON_TIME_ZONE);
+      let preview;
+      try {
+        preview = precomputed || await cronCalculator.calculate(config.cronExpression, { fromDate, count: 5, timeZone: config.timeZone || CRON_TIME_ZONE });
+      } catch (error) {
+        if (generation === this.scheduleGeneration) {
+          this.scheduleError = error.message;
+          this.nextRunAt = null;
+          this.upcomingRuns = [];
+          await this.addOperation('Pianificazione cron non avviata', error.message, 'error');
+        }
+        throw error;
+      }
+      if (generation !== this.scheduleGeneration) return;
+      this.upcomingRuns = preview.nextRuns.map((date) => new Date(date));
     } else {
       this.upcomingRuns = [new Date(fromDate.getTime() + Math.max(15, Number(config.intervalMinutes) || 60) * 60_000)];
     }
-    const nextDate = this.upcomingRuns[0] || getNextCronOccurrence(config.cronExpression, fromDate, config.timeZone || CRON_TIME_ZONE);
+    const nextDate = this.upcomingRuns[0];
+    this.scheduleError = '';
     this.nextRunAt = nextDate.toISOString();
     const delay = Math.max(250, Math.min(nextDate.getTime() - Date.now(), 2_147_000_000));
     this.timer = setTimeout(async () => {
+      if (generation !== this.scheduleGeneration) return;
       this.timer = null;
       if (Date.now() + 500 < nextDate.getTime()) {
-        this.scheduleNextRun(new Date());
+        await this.scheduleNextRun(new Date()).catch((error) => this.logger.error('[Raben-CRON] Ripianificazione fallita:', error.message));
         return;
       }
       try {
@@ -191,7 +238,13 @@ export class RabenCronService {
       } catch (error) {
         this.logger.error('[Raben-CRON] Errore durante il ciclo automatico:', error.message);
       } finally {
-        if (this.getSettings()?.cron?.enabled) this.scheduleNextRun(new Date());
+        if (generation === this.scheduleGeneration && this.getSettings()?.cron?.enabled) {
+          try {
+            await this.scheduleNextRun(new Date());
+          } catch (error) {
+            this.logger.error('[Raben-CRON] Ripianificazione fallita:', error.message);
+          }
+        }
       }
     }, delay);
   }
@@ -205,10 +258,12 @@ export class RabenCronService {
         ...newConfig,
       },
     };
+    const preview = merged.cron.scheduleMode === 'cron'
+      ? await cronCalculator.calculate(merged.cron.cronExpression, { count: 5, timeZone: merged.cron.timeZone || CRON_TIME_ZONE }) : undefined;
     if (this.saveSettings) {
       await this.saveSettings(merged);
     }
-    this.start();
+    await this.start(preview);
     const effective = this.getSettings()?.cron || merged.cron;
     const schedule = effective.scheduleMode === 'cron'
       ? describeCronExpression(effective.cronExpression)
@@ -231,6 +286,7 @@ export class RabenCronService {
 
     return {
       enabled: Boolean(config.enabled),
+      scheduleError: this.scheduleError,
       scheduleMode: config.scheduleMode === 'cron' ? 'cron' : 'interval',
       intervalMinutes: Number(config.intervalMinutes) || 60,
       cronExpression: config.cronExpression || '0 8-19 * * 1-5',
@@ -246,7 +302,8 @@ export class RabenCronService {
       statePriorities: config.statePriorities || FALLBACK_STATE_PRIORITIES,
       tierMinIntervalHours: config.tierMinIntervalHours || { high: 1, medium: 4, low: 8 },
       isRunning: this.isRunning,
-      isNightPaused: Boolean(config.enabled && config.nightPause && !withinHours),
+      isNightPaused: Boolean(!this.isRunning && config.enabled && config.nightPause && !withinHours),
+      operatingPolicy: { pauseAppliesAt: 'cycle-start', intervalFrom: 'cycle-end', missedRuns: 'skip', notificationsIndependent: true },
       lastRunAt: this.lastRunAt,
       nextRunAt: this.timer ? this.nextRunAt : null,
       lastRunSummary: this.lastRunSummary,
@@ -257,7 +314,8 @@ export class RabenCronService {
   stopScan() {
     if (this.isRunning) {
       this.cancelRequested = true;
-      void this.addOperation('Interruzione richiesta', 'Il ciclo verrà fermato al termine della spedizione corrente.', 'warning');
+      this.cycleController?.abort(Object.assign(new Error('Ciclo interrotto dall’operatore.'), { name: 'AbortError' }));
+      void this.addOperation('Interruzione richiesta', 'Interruzione delle attese e delle operazioni di rete in corso. Le scritture già ricevute da PrestaShop potrebbero essere completate.', 'warning');
       return { ok: true, message: 'Richiesta di interruzione inviata.' };
     }
     return { ok: false, message: 'Nessuna scansione in esecuzione.' };
@@ -294,6 +352,9 @@ export class RabenCronService {
     this.isRunning = true;
     this.cancelRequested = false;
     const startTime = Date.now();
+    this.cycleController = new AbortController();
+    const budget = deadline(this.cycleTimeoutMs || (60000 + (Number(config.batchSize) || 25) * 240000), this.cycleController.signal, 'Ciclo cron oltre il tempo massimo complessivo.');
+    const signal = budget.signal;
     let betaClient = null;
 
     try {
@@ -339,12 +400,13 @@ export class RabenCronService {
         fallbackReason: '',
       };
 
-      betaClient = this.rabenBetaClientFactory(rabenBetaConfig);
+      betaClient = this.rabenBetaClientFactory(rabenBetaConfig, { signal });
       const results = [];
       let deliveredCount = 0;
       let errorCount = 0;
 
       for (let i = 0; i < candidates.length; i++) {
+        signal.throwIfAborted();
         if (this.cancelRequested) {
           this.logger.log('[Raben-CRON] Scansione interrotta dall\'operatore.');
           break;
@@ -354,7 +416,11 @@ export class RabenCronService {
         this.activeProgress.currentTracking = candidate.trackingNumber;
 
         try {
-          const outcome = await betaClient.track(candidate.trackingNumber);
+          const outcome = await betaClient.track(candidate.trackingNumber, {
+            signal,
+            onWaiting: () => { if (this.activeProgress) this.activeProgress.phase = 'browser-waiting'; },
+            onStarted: () => { if (this.activeProgress) this.activeProgress.phase = 'checking'; },
+          });
           results.push({ trackingNumber: candidate.trackingNumber, ...outcome });
 
           if (outcome.status === 'Consegnata') {
@@ -364,9 +430,11 @@ export class RabenCronService {
           // Se compare captcha o blocco di accesso, effettua reset sessione e pausa prolungata
           if (outcome.reasonCode === 'ACCESS_GUARD' || outcome.status === 'Intervento manuale richiesto') {
             await betaClient.resetSession('Modalità affidabile attivata dopo una richiesta di verifica da parte di Raben.');
-            await new Promise((r) => setTimeout(r, 8000));
+            await pause(8000, signal);
           }
         } catch (error) {
+          signal.throwIfAborted();
+          if (['BROWSER_QUEUE_TIMEOUT', 'BROWSER_QUEUE_FULL'].includes(error.code)) throw error;
           errorCount++;
           results.push({
             trackingNumber: candidate.trackingNumber,
@@ -391,7 +459,8 @@ export class RabenCronService {
 
             if (!sameId && !sameName) {
               try {
-                await this.applyOrderState({ orderId: candidate.orderId, stateId: mapping.stateId });
+                signal.throwIfAborted();
+                await this.applyOrderState({ orderId: candidate.orderId, stateId: mapping.stateId, signal });
                 await this.syncManualState({
                   trackingNumber: candidate.trackingNumber,
                   orderId: candidate.orderId,
@@ -401,10 +470,12 @@ export class RabenCronService {
                 });
                 this.logger.log(`[Raben-CRON] Auto-allineato ordine ${candidate.orderId} allo stato "${mapping.stateName}"`);
                 if (this.notificationService) {
-                  await this.notificationService.notifyAutoSyncSuccess(candidate, mapping.stateName).catch(() => {});
+                  await this.queueNotification(() => this.notificationService.notifyAutoSyncSuccess(candidate, mapping.stateName, { signal, eventAt: latestOutcome.statusAt, stateId: mapping.stateId }));
                 }
               } catch (syncErr) {
                 this.logger.error(`[Raben-CRON] Errore auto-allineamento ordine ${candidate.orderId}:`, syncErr.message);
+                await this.addOperation('Allineamento PrestaShop non confermato', syncErr.message, 'warning', { orderId: candidate.orderId, trackingNumber: candidate.trackingNumber, outcomeUnknown: syncErr.code === 'WRITE_OUTCOME_UNKNOWN' });
+                signal.throwIfAborted();
               }
             }
           }
@@ -413,7 +484,7 @@ export class RabenCronService {
           const isExceptionStatus = isRabenExceptionOutcome(latestOutcome);
 
           if (isExceptionStatus && this.notificationService) {
-            await this.notificationService.notifyException(candidate, latestOutcome).catch(() => {});
+            await this.queueNotification(() => this.notificationService.notifyException(candidate, latestOutcome, { signal }));
           }
         }
 
@@ -430,20 +501,12 @@ export class RabenCronService {
           const delayMs = typeof betaClient.getPacingDelay === 'function'
             ? betaClient.getPacingDelay('cron')
             : this.jitterFn();
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          this.activeProgress.phase = 'waiting';
+          await pause(delayMs, signal);
         }
       }
 
-      // 3. Controllo SLA > 48h e Daily Digest a fine scansione
-      if (this.notificationService) {
-        await this.checkSlaBreaches().catch((err) => {
-          this.logger.error('[Raben-CRON] Errore verifica SLA:', err.message);
-        });
-        await this.checkDailyDigest().catch((err) => {
-          this.logger.error('[Raben-CRON] Errore verifica daily digest:', err.message);
-        });
-      }
-
+      signal.throwIfAborted();
       this.lastRunAt = new Date().toISOString();
       const durationSeconds = Math.round((Date.now() - startTime) / 1000);
       this.lastRunSummary = {
@@ -479,6 +542,12 @@ export class RabenCronService {
 
       return this.lastRunSummary;
     } catch (error) {
+      if (signal.aborted) {
+        this.lastRunAt = new Date().toISOString();
+        this.lastRunSummary = { at: this.lastRunAt, type: this.cancelRequested ? 'cancelled' : 'timed-out', checked: this.activeProgress?.completed || 0, totalCandidates: this.activeProgress?.total || 0, durationSeconds: Math.round((Date.now() - startTime) / 1000), reason: signal.reason?.message || error.message };
+        await this.addOperation('Ciclo interrotto', this.lastRunSummary.reason, 'warning', { trigger: manual ? 'manual' : 'automatic' });
+        return this.lastRunSummary;
+      }
       await this.addOperation(
         manual ? 'Verifica manuale fallita' : 'Ciclo automatico fallito',
         error.message || 'Errore imprevisto durante il controllo.',
@@ -487,69 +556,113 @@ export class RabenCronService {
       );
       throw error;
     } finally {
-      await betaClient?.close?.();
-      this.isRunning = false;
-      this.cancelRequested = false;
-      this.activeProgress = null;
-
+      try {
+        await betaClient?.close?.();
+      } catch (error) {
+        this.logger.error('[Raben-CRON] Errore chiusura client:', error.message);
+      } finally {
+        budget.dispose();
+        this.cycleController = null;
+        this.isRunning = false;
+        this.cancelRequested = false;
+        this.activeProgress = null;
+      }
     }
   }
 
-  async checkSlaBreaches() {
+  notificationChecksEnabled() {
     const settings = this.getSettings();
-    if (!settings?.notifications?.triggers?.sla48h || !this.notificationService) return;
-
-    const now = Date.now();
-    // Evita di ripetere l'alert SLA più di una volta ogni 24 ore
-    if (this.lastSlaCheckAt && (now - this.lastSlaCheckAt) < 24 * 3600_000) return;
-
-    const db = await this.loadShipments();
-    const records = Object.values(db?.shipments || {});
-    const thresholdMs = 48 * 3600_000;
-
-    const delayed = records.filter((r) => {
-      if (!r || r.archived || r.rabenStatus === 'Consegnata') return false;
-      const refTime = r.rabenCheckedAt ? new Date(r.rabenCheckedAt).getTime() : new Date(r.createdAt || 0).getTime();
-      return (now - refTime) > thresholdMs;
-    });
-
-    if (delayed.length) {
-      this.lastSlaCheckAt = now;
-      await this.notificationService.notifySlaBreach(delayed);
-    }
+    const config = settings?.notifications;
+    return Boolean(settings?.cron?.enabled && this.notificationService
+      && (config?.telegram?.enabled || config?.email?.enabled)
+      && (config.triggers?.sla48h || config.triggers?.dailyDigest));
   }
 
-  async checkDailyDigest() {
-    const settings = this.getSettings();
-    const triggers = settings?.notifications?.triggers;
-    if (!triggers?.dailyDigest || !this.notificationService) return;
+  startNotificationChecks() {
+    const generation = ++this.notificationGeneration;
+    if (this.notificationTimer) clearTimeout(this.notificationTimer);
+    this.notificationTimer = null;
+    this.notificationController?.abort();
+    const arm = (delay) => {
+      if (generation !== this.notificationGeneration || !this.notificationChecksEnabled()) return;
+      this.notificationTimer = setTimeout(async () => {
+        if (generation !== this.notificationGeneration) return;
+        this.notificationTimer = null;
+        if (this.notificationEvaluation) { arm(60000); return; }
+        const controller = new AbortController();
+        this.notificationController = controller;
+        const budget = deadline(30000, controller.signal, 'Controllo notifiche oltre il limite.');
+        try { await this.checkOperationalNotifications({ signal: budget.signal }); }
+        catch (error) {
+          if (!controller.signal.aborted) {
+            this.logger.error('[Raben-CRON] Controllo notifiche fallito:', error.message);
+            await this.addOperation('Controllo notifiche fallito', error.message, 'error');
+          }
+        } finally {
+          budget.dispose();
+          if (this.notificationController === controller) this.notificationController = null;
+          arm(60000);
+        }
+      }, delay);
+      this.notificationTimer.unref?.();
+    };
+    arm(0);
+  }
 
+  async previewNotifications(signal) {
+    if (this.previewPromise) return this.previewPromise;
     const now = new Date();
-    const targetHour = Number(triggers.digestHour ?? 8);
-    const targetMinute = Number(triggers.digestMinute ?? 30);
-    const currentHour = now.getHours();
-    const currentMinute = now.getMinutes();
+    const work = (async () => buildNotificationSummary((await this.loadShipments())?.shipments || {}, { now, signal }))();
+    this.previewPromise = work;
+    try { return await work; }
+    finally { if (this.previewPromise === work) this.previewPromise = null; }
+  }
 
-    // Invia se siamo all'interno o oltre la finestra oraria del digest
-    const isDigestTime = (currentHour === targetHour && currentMinute >= targetMinute) || (currentHour > targetHour);
-    const todayKey = now.toISOString().slice(0, 10);
+  async checkOperationalNotifications({ signal, now = new Date() } = {}) {
+    if (this.notificationEvaluation) return this.notificationEvaluation;
+    const work = this.evaluateNotifications(signal, now);
+    this.notificationEvaluation = work;
+    try { return await work; }
+    finally { if (this.notificationEvaluation === work) this.notificationEvaluation = null; }
+  }
 
-    if (isDigestTime && this.lastDigestSentDate !== todayKey) {
-      const db = await this.loadShipments();
-      const records = Object.values(db?.shipments || {});
-      const totalActive = records.filter((r) => !r.archived && r.rabenStatus !== 'Consegnata').length;
-      const deliveredToday = records.filter((r) => r.rabenStatus === 'Consegnata' && r.rabenCheckedAt && r.rabenCheckedAt.slice(0, 10) === todayKey).length;
-      const exceptions = records.filter((r) => !r.archived && (r.rabenStatus === 'Eccezione Raben' || r.caseStatus === 'Aperta')).length;
-      const thresholdMs = 48 * 3600_000;
-      const delayed = records.filter((r) => !r.archived && r.rabenStatus !== 'Consegnata' && (now.getTime() - new Date(r.rabenCheckedAt || r.createdAt || 0).getTime()) > thresholdMs).length;
-
-      this.lastDigestSentDate = todayKey;
-      await this.notificationService.sendDailyDigest({
-        totalActive,
-        deliveredToday,
-        exceptions,
-        delayed,
-      });
+  async evaluateNotifications(signal, now) {
+    signal?.throwIfAborted();
+    if (!this.notificationChecksEnabled()) return { skipped: true };
+    const config = this.getSettings().notifications;
+    const triggers = config.triggers || {};
+    const channels = ['telegram', 'email'].filter((channel) => config[channel]?.enabled).map((channel) => [channel, channelIdentity(channel, config[channel])]);
+    const context = JSON.stringify([romeDay(now), channels]);
+    const p = romeParts(now);
+    const digestDue = +p.hour * 60 + +p.minute >= Number(triggers.digestHour ?? 8) * 60 + Number(triggers.digestMinute ?? 30);
+    const checkSla = triggers.sla48h && this.lastSlaContext !== context;
+    const checkDigest = triggers.dailyDigest && digestDue && this.lastDigestContext !== context;
+    if (!checkSla && !checkDigest) return { skipped: true };
+    const summary = await buildNotificationSummary((await this.loadShipments())?.shipments || {}, { now, signal });
+    signal?.throwIfAborted();
+    this.lastNotificationCheck = { at: now.toISOString(), day: summary.day, delayed: summary.delayed, missingEventDate: summary.missingEventDate, futureEventDate: summary.futureEventDate, totalActive: summary.totalActive };
+    const accepted = (result) => result?.accepted === true || result?.queued > 0 || result?.duplicates > 0;
+    const results = {};
+    // Each channel's persistent marker is the phase-4 outbox entry, not these
+    // in-memory shortcuts. A restart deduplicates against that durable entry.
+    for (const kind of ['sla', 'digest']) {
+      if (kind === 'sla' ? !checkSla || !summary.delayed : !checkDigest) continue;
+      signal?.throwIfAborted();
+      try {
+        const result = kind === 'sla'
+          ? await this.notificationService.notifySlaBreach(summary.delayedExamples, { signal, date: now, count: summary.delayed })
+          : await this.notificationService.sendDailyDigest(summary, { signal, date: now });
+        results[kind] = result;
+        if (accepted(result)) {
+          if (kind === 'sla') this.lastSlaContext = context;
+          else this.lastDigestContext = context;
+        }
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        results[kind] = { error: true };
+        await this.addOperation(kind === 'sla' ? 'Notifica SLA non accodata' : 'Riepilogo non accodato', error.message, 'error');
+      }
     }
+    return { summary, results };
   }
 }

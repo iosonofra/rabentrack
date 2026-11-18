@@ -1,6 +1,7 @@
 const MONTH_NAMES = Object.freeze({ JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 });
 const WEEKDAY_NAMES = Object.freeze({ SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 });
 const WEEKDAY_FROM_INTL = Object.freeze({ Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 });
+const formatters = new Map();
 const FIELD_DEFINITIONS = Object.freeze([
   { name: 'minuto', min: 0, max: 59 },
   { name: 'ora', min: 0, max: 23 },
@@ -66,6 +67,7 @@ function parseField(source, definition) {
 
 export function parseCronExpression(expression) {
   const source = String(expression || '').trim().replace(/\s+/g, ' ');
+  if (source.length > 120) throw new Error('Espressione cron troppo lunga (massimo 120 caratteri).');
   const fields = source.split(' ');
   if (fields.length !== 5) throw new Error('L’espressione cron deve contenere esattamente 5 campi: minuto, ora, giorno, mese e giorno della settimana.');
   const parsed = fields.map((field, index) => parseField(field, FIELD_DEFINITIONS[index]));
@@ -73,12 +75,16 @@ export function parseCronExpression(expression) {
 }
 
 function localDateParts(date, timeZone) {
-  const parts = new Intl.DateTimeFormat('en-US', {
+  if (!formatters.has(timeZone)) {
+    if (formatters.size >= 8) formatters.delete(formatters.keys().next().value);
+    formatters.set(timeZone, new Intl.DateTimeFormat('en-US', {
     timeZone,
     hourCycle: 'h23',
     year: 'numeric', month: 'numeric', day: 'numeric',
     hour: 'numeric', minute: 'numeric', weekday: 'short',
-  }).formatToParts(date).reduce((output, part) => {
+    }));
+  }
+  const parts = formatters.get(timeZone).formatToParts(date).reduce((output, part) => {
     if (part.type !== 'literal') output[part.type] = part.value;
     return output;
   }, {});
@@ -107,11 +113,26 @@ export function getNextCronOccurrence(expression, fromDate = new Date(), timeZon
   const start = new Date(fromDate);
   if (Number.isNaN(start.getTime())) throw new Error('Data iniziale non valida per il calcolo cron.');
   let cursor = new Date(Math.floor(start.getTime() / 60_000) * 60_000 + 60_000);
-  const maxMinutes = 366 * 24 * 60 + 1440;
-  for (let checked = 0; checked < maxMinutes; checked++, cursor = new Date(cursor.getTime() + 60_000)) {
+  // Leap-day schedules may legitimately have no occurrence within a year.
+  const deadline = start.getTime() + 8 * 366 * 24 * 60 * 60_000;
+  if (parsed.dayOfWeek.wildcard && ![...parsed.month.values].some((month) => {
+    const lastDay = new Date(Date.UTC(2024, month, 0)).getUTCDate();
+    return [...parsed.dayOfMonth.values].some((day) => day <= lastDay);
+  })) throw new Error('L’espressione cron indica una data impossibile.');
+  while (cursor.getTime() <= deadline) {
     if (cronMatchesDate(parsed, cursor, timeZone)) return cursor;
+    const local = localDateParts(cursor, timeZone);
+    // Skip only inside the current local hour. DST is re-evaluated at its boundary.
+    const nextMinute = [...parsed.minute.values].sort((a, b) => a - b).find((minute) => minute > local.minute);
+    const dom = parsed.dayOfMonth.values.has(local.dayOfMonth);
+    const dow = parsed.dayOfWeek.values.has(local.dayOfWeek);
+    const day = !parsed.dayOfMonth.wildcard && !parsed.dayOfWeek.wildcard ? dom || dow : dom && dow;
+    const eligibleHour = parsed.month.values.has(local.month) && day && parsed.hour.values.has(local.hour);
+    const step = eligibleHour && nextMinute !== undefined
+      ? nextMinute - local.minute : 60 - local.minute;
+    cursor = new Date(cursor.getTime() + Math.max(1, step) * 60_000);
   }
-  throw new Error('Nessuna esecuzione trovata entro un anno: controlla l’espressione cron.');
+  throw new Error('Nessuna esecuzione trovata entro otto anni: controlla l’espressione cron.');
 }
 
 export function getNextCronOccurrences(expression, fromDate = new Date(), count = 5, timeZone = CRON_TIME_ZONE) {

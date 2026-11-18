@@ -3,32 +3,54 @@ import { randomUUID } from 'node:crypto';
 import express from 'express';
 import multer from 'multer';
 import { createFrontendAssets } from './frontend-assets.js';
+import { createRuntimeDiagnostics } from './runtime-diagnostics.js';
 import { readRabenWorkbook } from './excel-import.js';
 import { isImportRowEligible, normalizeImportOptions } from './import-eligibility.js';
 import { PrestaShopClient } from './prestashop-client.js';
 import { exportSettingsData, loadSettings, normalizeCronSettings, normalizeRabenStateMappings, normalizeNotificationSettings, restoreSettingsData, saveSettings } from './settings-store.js';
 import { DEFAULT_Raben_TRACKING_URL, Raben_PARSER_VERSION, Raben_SPEED_PROFILES, RabenBetaClient, normalizeBetaSettings } from './raben-beta-client.js';
 import { RabenCronService } from './raben-cron.js';
-import { CRON_PRESETS, CRON_TIME_ZONE, previewCronExpression } from './cron-scheduler.js';
+import { CRON_PRESETS, CRON_TIME_ZONE, describeCronExpression } from './cron-scheduler.js';
+import { cronCalculator } from './cron-calculator.js';
+import { waitFor } from './operation-control.js';
+import { flushShipmentWrites, getShipmentPersistenceStats } from './shipment-store.js';
+import { TemporaryStore, capacityError, estimateBytes, startTemporaryCleanup } from './temporary-store.js';
+import { browserCoordinator } from './browser-coordinator.js';
 import { NotificationService } from './notification-service.js';
+import { NotificationOutbox } from './notification-outbox.js';
 import { archiveShipment, deleteArchivedShipment, deleteImportBatch, exportShipmentsData, getAuditLog, getControlCenter, getExistingShipmentsIndex, getImportBatches, getOperationLog, getShipment, linkShipmentToPrestaShopOrder, registerImportBatch, registerOperation, restoreShipmentsData, searchShipments, syncAppliedShipments, syncRabenShipments, syncManualPrestaShopState, syncShipmentPrestaShopShipping, syncVerifiedShipments, updateShipmentCase } from './shipment-store.js';
 
 const app = express();
+const shutdownController = new AbortController();
+let shuttingDown = false;
+app.use((_req, res, next) => shuttingDown ? res.status(503).json({ error: 'Servizio in arresto: riprova tra pochi secondi.' }) : next());
+const runtimeDiagnostics = createRuntimeDiagnostics();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 const port = Number(process.env.PORT ?? 3000);
 const VERIFY_BATCH_SIZE = 30;
 const VERIFIED_IMPORT_TTL_MS = 15 * 60 * 1000;
-const verifiedImports = new Map();
-const verificationJobs = new Map();
-const applyJobs = new Map();
-const rabenBetaJobs = new Map();
+const MiB = 1024 * 1024;
+const verifiedImports = new TemporaryStore({ name: 'verifiedImports', maxEntries: 40, maxBytes: 24 * MiB, ttlMs: VERIFIED_IMPORT_TTL_MS, protectedValue: (value) => value.inUse || value._working });
+const verificationJobs = new TemporaryStore({ name: 'verificationJobs', maxEntries: 100, maxBytes: 24 * MiB, ttlMs: 3600000, protectedValue: (job) => job._working || Boolean(verifiedImports.get(job.result?.verificationId)?.inUse) });
+const applyJobs = new TemporaryStore({ name: 'applyJobs', maxEntries: 100, maxBytes: 24 * MiB, ttlMs: 3600000, protectedValue: (job) => job._working });
+const rabenBetaJobs = new TemporaryStore({ name: 'rabenBetaJobs', maxEntries: 100, maxBytes: 32 * MiB, ttlMs: 3600000, protectedValue: (job) => job._working });
 const Raben_BETA_BATCH_SIZE = 10;
 const Raben_BETA_MAX_ROWS = 100;
-const Raben_BETA_JOB_RETENTION_MS = 6 * 60 * 60 * 1000;
 const Raben_BETA_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const Raben_MOVING_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const Raben_NOT_FOUND_CACHE_TTL_MS = 60 * 60 * 1000;
-const rabenBetaCache = new Map();
+const rabenBetaCache = new TemporaryStore({ name: 'rabenBetaCache', maxEntries: 1000, maxBytes: 16 * MiB, ttlMs: Raben_BETA_CACHE_TTL_MS, optional: true });
+const temporaryStores = [verifiedImports, verificationJobs, applyJobs, rabenBetaJobs, rabenBetaCache];
+const stopTemporaryCleanup = startTemporaryCleanup(temporaryStores);
+let synchronousApplyCount = 0;
+
+function workingCount(store) { return [...store.values()].filter((job) => job._working).length; }
+function importReservation(rows) {
+  if (rows.length > 5000) throw capacityError('La verifica accetta al massimo 5000 righe per operazione. Suddividi il file.');
+  const bytes = estimateBytes(rows, 8 * MiB);
+  if (!Number.isFinite(bytes)) throw capacityError('Le righe sono troppo grandi. Suddividi il file e riprova.');
+  return bytes * 2 + rows.length * 2048;
+}
 const prestashopOrderStateLocks = new Map();
 
 let rabenBetaQueue = Promise.resolve();
@@ -43,6 +65,15 @@ let connection = await loadSettings({
 const notificationService = new NotificationService({
   getSettings: () => connection,
 });
+const notificationOutbox = new NotificationOutbox({
+  getConfig: () => connection.notifications,
+  deliver: (channel, payload, signal) => channel === 'telegram'
+    ? notificationService.sendTelegram({ ...payload, signal })
+    : notificationService.sendEmail({ ...payload, signal }),
+});
+notificationService.outbox = notificationOutbox;
+try { await notificationOutbox.start(); }
+catch (error) { console.error('[NOTIFICATIONS-OUTBOX] Coda non disponibile:', error.message); }
 
 const cronService = new RabenCronService({
   getSettings: () => connection,
@@ -50,39 +81,39 @@ const cronService = new RabenCronService({
     connection = updated;
     await saveSettings(connection);
   },
-  rabenBetaClientFactory: (cfg) => new RabenBetaClient(cfg),
+  rabenBetaClientFactory: (cfg, options) => new RabenBetaClient(cfg, { scope: 'cron', signal: AbortSignal.any([shutdownController.signal, options.signal]) }),
   loadShipments: exportShipmentsData,
   syncRabenShipments,
-  applyOrderState: async ({ orderId, stateId }) => {
-    await withPrestaShopOrderStateLock(orderId, () => client().applyOrderStateSafely({ orderId, stateId }));
+  applyOrderState: async ({ orderId, stateId, signal }) => {
+    await withPrestaShopOrderStateLock(orderId, () => client({ signal }).applyOrderStateSafely({ orderId, stateId }), signal);
   },
   syncManualState: syncManualPrestaShopState,
   notificationService,
   recordOperation: (operation) => registerOperation({ scope: 'cron', ...operation }),
 });
 
-cronService.start();
+void cronService.start().catch((error) => console.error('[Raben-CRON] Avvio pianificazione fallito:', error.message));
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(createFrontendAssets());
 app.use(express.static('public', { setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache') }));
 
-function client() {
+function client({ signal } = {}) {
   if (!connection.baseUrl || !connection.apiKey) throw new Error('Inserisci URL e chiave Webservice di PrestaShop.');
-  return new PrestaShopClient(connection);
+  return new PrestaShopClient({ ...connection, signal: signal ? AbortSignal.any([shutdownController.signal, signal]) : shutdownController.signal });
 }
 
-async function withPrestaShopOrderStateLock(orderId, operation) {
+async function withPrestaShopOrderStateLock(orderId, operation, signal) {
   const key = String(orderId);
   const previous = prestashopOrderStateLocks.get(key) || Promise.resolve();
-  const current = previous.catch(() => {}).then(operation);
+  const current = previous.catch(() => {}).then(() => { signal?.throwIfAborted(); shutdownController.signal.throwIfAborted(); return operation(); });
   prestashopOrderStateLocks.set(key, current);
-  try {
-    return await current;
-  } finally {
+  const cleanup = () => {
     if (prestashopOrderStateLocks.get(key) === current) prestashopOrderStateLocks.delete(key);
-  }
+  };
+  void current.then(cleanup, cleanup);
+  return waitFor(current, signal);
 }
 
 async function alignShipmentPrestaShopState({ trackingNumber, stateId, targetState, shop }) {
@@ -181,12 +212,14 @@ app.post('/api/backup/restore', upload.single('file'), async (req, res) => {
 
     let restoredSettings = false;
     if (settings && typeof settings === 'object') {
+      const restoredCron = normalizeCronSettings(settings.cron || {});
+      if (restoredCron.scheduleMode === 'cron') await cronCalculator.calculate(restoredCron.cronExpression, { count: 5, timeZone: CRON_TIME_ZONE });
       connection = await restoreSettingsData(settings, {
         baseUrl: process.env.PRESTASHOP_URL ?? '',
         apiKey: process.env.PRESTASHOP_WEBSERVICE_KEY ?? '',
       });
       restoredSettings = true;
-      cronService.start();
+      await cronService.start();
     }
 
     const { restoredCount } = await restoreShipmentsData(shipments, payload.operations, payload.discoveredRabenStatuses);
@@ -223,7 +256,7 @@ app.post('/api/raben-beta/config', async (req, res) => {
 
 app.post('/api/raben-beta/test', async (_req, res) => {
   try {
-    const beta = new RabenBetaClient(connection.rabenBeta);
+    const beta = new RabenBetaClient(connection.rabenBeta, { signal: shutdownController.signal });
     await beta.testConnection();
     res.json({ ok: true, message: 'Camofox locale è raggiungibile. Il portale pubblico Raben non richiede credenziali.' });
   } catch (error) { res.status(400).json({ error: `Connessione Camofox non disponibile: ${error.message}` }); }
@@ -232,14 +265,20 @@ app.post('/api/raben-beta/test', async (_req, res) => {
 app.post('/api/raben-beta/jobs', (req, res) => {
   try {
     if (!connection.rabenBeta?.enabled) throw new Error('Attiva prima la verifica pubblica Raben e salva la configurazione.');
-    const trackingNumbers = [...new Set((req.body?.trackingNumbers ?? []).map((value) => String(value).trim()).filter(Boolean))];
+    const suppliedTracking = req.body?.trackingNumbers;
+    if (!Array.isArray(suppliedTracking) || suppliedTracking.length > Raben_BETA_MAX_ROWS) throw new Error(`La verifica accetta al massimo ${Raben_BETA_MAX_ROWS} spedizioni per operazione.`);
+    const trackingNumbers = [...new Set(suppliedTracking.map((value) => String(value).trim()).filter(Boolean))];
+    if (trackingNumbers.some((value) => value.length > 80)) throw new Error('Numero tracking troppo lungo (massimo 80 caratteri).');
     if (!trackingNumbers.length) throw new Error('Seleziona almeno una riga con un tracking da verificare.');
     if (trackingNumbers.length > Raben_BETA_MAX_ROWS) throw new Error(`La verifica accetta al massimo ${Raben_BETA_MAX_ROWS} spedizioni per operazione.`);
     const queuedAhead = [...rabenBetaJobs.values()].filter((candidate) => ['queued', 'running', 'cancelling'].includes(candidate.status)).length;
+    if (workingCount(rabenBetaJobs) >= 11) throw capacityError('Coda Raben piena (massimo 10 operazioni in attesa). Attendi e riprova.');
     const job = {
       id: randomUUID(),
       status: 'queued',
+      _working: true,
       cancelRequested: false,
+      abortController: new AbortController(),
       results: [],
       averageDurationMs: 0,
       config: { ...connection.rabenBeta },
@@ -266,10 +305,10 @@ app.post('/api/raben-beta/jobs', (req, res) => {
       result: null,
       error: null,
     };
-    rabenBetaJobs.set(job.id, job);
+    rabenBetaJobs.set(job.id, job, trackingNumbers.length * 16384 + 4096);
     scheduleRabenBetaJob(job, trackingNumbers);
     res.status(202).json({ jobId: job.id, progress: job.progress });
-  } catch (error) { res.status(400).json({ error: error.message }); }
+  } catch (error) { res.status(error.status || 400).json({ error: error.message }); }
 });
 
 app.get('/api/raben-beta/jobs/:jobId', (req, res) => {
@@ -294,14 +333,30 @@ app.post('/api/raben-beta/jobs/:jobId/cancel', (req, res) => {
     return res.json({ ok: true, status: job.status, message: 'La verifica è già terminata.' });
   }
   job.cancelRequested = true;
+  job.abortController?.abort();
   job.status = 'cancelling';
   job.progress.phase = 'cancelling';
   job.progress.updatedAt = new Date().toISOString();
-  res.status(202).json({ ok: true, status: job.status, message: 'La verifica si interromperà dopo la spedizione corrente.' });
+  res.status(202).json({ ok: true, status: job.status, message: 'Interruzione richiesta: attendo la chiusura della verifica in corso.' });
 });
 
 app.get('/api/cron/status', (_req, res) => {
   res.json(cronService.getStatus());
+});
+
+app.get('/api/cron/diagnostics', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const status = cronService.getStatus();
+  res.json({
+    runtime: runtimeDiagnostics.snapshot(),
+    cron: { enabled: status.enabled, isRunning: status.isRunning, lastRunAt: status.lastRunAt, nextRunAt: status.nextRunAt, lastRunSummary: status.lastRunSummary },
+    temporaryEntries: { verificationJobs: verificationJobs.size, applyJobs: applyJobs.size, verifiedImports: verifiedImports.size, rabenBetaJobs: rabenBetaJobs.size, rabenBetaCache: rabenBetaCache.size },
+    temporaryLimits: Object.fromEntries(temporaryStores.map((store) => [store.name, store.stats()])),
+    browserCoordinator: browserCoordinator.stats(),
+    notificationOutbox: { ...notificationOutbox.status(1), entries: undefined },
+    persistence: { shipments: getShipmentPersistenceStats() },
+    notificationChecks: { running: Boolean(cronService.notificationEvaluation), lastCheck: cronService.lastNotificationCheck, timeZone: 'Europe/Rome', intervalMs: 60000 },
+  });
 });
 
 app.get('/api/cron/log', async (req, res) => {
@@ -317,15 +372,17 @@ app.get('/api/cron/presets', (_req, res) => {
     timeZone: CRON_TIME_ZONE,
     presets: CRON_PRESETS.map((preset) => ({
       ...preset,
-      description: previewCronExpression(preset.expression, { count: 1 }).description,
+      description: describeCronExpression(preset.expression),
     })),
   });
 });
 
-app.get('/api/cron/preview', (req, res) => {
+app.get('/api/cron/preview', async (req, res) => {
+  const controller = new AbortController();
+  res.on('close', () => { if (!res.writableEnded) controller.abort(); });
   try {
     const expression = String(req.query.expression || '').trim();
-    res.json(previewCronExpression(expression, { count: 5, timeZone: CRON_TIME_ZONE }));
+    res.json(await cronCalculator.calculate(expression, { count: 5, timeZone: CRON_TIME_ZONE }, controller.signal));
   } catch (error) {
     res.status(400).json({ valid: false, error: error.message, nextRuns: [] });
   }
@@ -432,6 +489,8 @@ app.post('/api/notifications/config', async (req, res) => {
     connection = { ...connection, notifications };
     await saveSettings(connection);
     res.json({ ok: true, notifications, message: 'Impostazioni di notifica salvate con successo.' });
+    notificationOutbox.wake();
+    cronService.startNotificationChecks();
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -457,28 +516,35 @@ app.post('/api/notifications/test-email', async (req, res) => {
   }
 });
 
+app.get('/api/notifications/preview', async (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try { res.json(await cronService.previewNotifications(shutdownController.signal)); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 app.post('/api/notifications/trigger-digest', async (_req, res) => {
   try {
-    const db = await exportShipmentsData();
-    const records = Object.values(db?.shipments || {});
-    const now = new Date();
-    const todayKey = now.toISOString().slice(0, 10);
-    const totalActive = records.filter((r) => !r.archived && r.rabenStatus !== 'Consegnata').length;
-    const deliveredToday = records.filter((r) => r.rabenStatus === 'Consegnata' && r.rabenCheckedAt && r.rabenCheckedAt.slice(0, 10) === todayKey).length;
-    const exceptions = records.filter((r) => !r.archived && (r.rabenStatus === 'Eccezione Raben' || r.caseStatus === 'Aperta')).length;
-    const thresholdMs = 48 * 3600_000;
-    const delayed = records.filter((r) => !r.archived && r.rabenStatus !== 'Consegnata' && (now.getTime() - new Date(r.rabenCheckedAt || r.createdAt || 0).getTime()) > thresholdMs).length;
-
-    const result = await notificationService.sendDailyDigest({
-      totalActive,
-      deliveredToday,
-      exceptions,
-      delayed,
-    });
-    res.json({ ok: true, message: 'Digest inviato con successo ai canali attivi.', result });
+    const summary = await cronService.previewNotifications(shutdownController.signal);
+    const result = await notificationService.sendDailyDigest(summary, { signal: shutdownController.signal, date: new Date(summary.asOf) });
+    res.json({ ok: true, message: result.skipped ? 'Riepilogo non accodato: verifica canali e trigger attivi.' : result.queued ? 'Riepilogo salvato in coda per l’invio.' : 'Riepilogo già accodato o inviato oggi ai canali attivi.', result });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
+});
+
+app.get('/api/notifications/outbox', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(notificationOutbox.status(req.query.limit));
+});
+app.post('/api/notifications/outbox/:id/retry', async (req, res) => {
+  try {
+    await notificationOutbox.retry(req.params.id, { confirmUncertain: req.body?.confirmUncertain === true });
+    res.json({ ok: true, message: 'Notifica nuovamente in coda.' });
+  } catch (error) { res.status(notificationOutbox.storageError ? 503 : 409).json({ error: error.message }); }
+});
+app.post('/api/notifications/outbox/:id/discard', async (req, res) => {
+  try { await notificationOutbox.discard(req.params.id); res.json({ ok: true, message: 'Notifica annullata.' }); }
+  catch (error) { res.status(notificationOutbox.storageError ? 503 : 409).json({ error: error.message }); }
 });
 
 app.get('/api/history/batches', async (req, res) => {
@@ -1117,13 +1183,23 @@ app.post('/api/import/preview', upload.single('file'), async (req, res) => {
 });
 
 app.post('/api/import/verification-jobs', (req, res) => {
+  let verificationId;
+  try {
   const { rows, filename, origin } = req.body ?? {};
   if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'Carica prima un file da verificare.' });
+  if (workingCount(verificationJobs) >= 2) throw capacityError('Sono già in corso due verifiche import. Attendi e riprova.');
+  const reservation = importReservation(rows);
+  verificationId = randomUUID();
+  verifiedImports.set(verificationId, { rows: [], pending: true, _working: true, expiresAt: Infinity }, reservation);
   const candidates = rows.filter((row) => row.validation === 'Pronta per la verifica' && !row.alreadyImported);
-  const job = { id: randomUUID(), filename, origin, status: 'running', cancelRequested: false, progress: { completed: 0, total: candidates.length, outcomes: {} }, result: null, error: null };
-  verificationJobs.set(job.id, job);
+  const job = { id: randomUUID(), verificationId, _working: true, filename: String(filename || '').slice(0, 240), origin: String(origin || '').slice(0, 40), status: 'running', cancelRequested: false, progress: { completed: 0, total: candidates.length, outcomes: {} }, result: null, error: null };
+  verificationJobs.set(job.id, job, reservation);
   void runVerification(job, rows);
   res.status(202).json({ jobId: job.id, progress: job.progress });
+  } catch (error) {
+    if (verificationId) verifiedImports.delete(verificationId);
+    res.status(error.status || 400).json({ error: error.message });
+  }
 });
 
 app.post('/api/import/verification-jobs/:jobId/cancel', (req, res) => {
@@ -1141,17 +1217,13 @@ app.get('/api/import/verification-jobs/:jobId', (req, res) => {
 });
 
 app.post('/api/import/apply', async (req, res) => {
+  let lockedVerification;
   try {
-    const { verificationId, carrierId, stateId, selectedSourceRows } = req.body ?? {};
-    const { updateTracking, updateState, overwriteTracking } = normalizeImportOptions(req.body ?? {});
-    const verified = verifiedImports.get(verificationId);
-    if (!verified || verified.expiresAt < Date.now()) throw new Error('La verifica è scaduta. Eseguila nuovamente prima di importare.');
-    const selectedRows = new Set((selectedSourceRows ?? []).map(Number));
-    if (!updateTracking && !updateState) throw new Error('Scegli almeno un aggiornamento: tracking/corriere o stato ordine.');
-    if (updateTracking && !carrierId) throw new Error('Seleziona un corriere per aggiornare tracking e corriere.');
-    if (updateState && !stateId) throw new Error('Seleziona uno stato ordine da applicare.');
-    const rows = verified.rows.filter((row) => selectedRows.has(Number(row.sourceRow)) && isImportRowEligible(row, { updateTracking, updateState, overwriteTracking }));
-    if (!rows.length) throw new Error('Nessuna riga selezionata è applicabile con le opzioni correnti. Riesegui la verifica o modifica le opzioni.');
+    const { verified, verificationId, carrierId, stateId, updateTracking, updateState, overwriteTracking, rows } = prepareApply(req.body ?? {});
+    if (synchronousApplyCount + workingCount(applyJobs) >= 2) throw capacityError('Sono già in corso due aggiornamenti import. Attendi e riprova.');
+    lockedVerification = verified;
+    verified.inUse = true;
+    synchronousApplyCount++;
     const shop = client();
     const results = [];
     for (const row of rows) {
@@ -1171,19 +1243,22 @@ app.post('/api/import/apply', async (req, res) => {
     await syncAppliedShipments(results);
     verifiedImports.delete(verificationId);
     res.json({ summary, results });
-  } catch (error) { res.status(400).json({ error: error.message }); }
+  } catch (error) { res.status(error.status || 400).json({ error: error.message }); }
+  finally {
+    if (lockedVerification) { lockedVerification.inUse = false; synchronousApplyCount--; }
+  }
 });
 
 app.post('/api/import/apply-jobs', (req, res) => {
   try {
     const prepared = prepareApply(req.body ?? {});
-    if (prepared.verified.inUse) throw new Error('Un aggiornamento per questa verifica è già in corso.');
+    if (synchronousApplyCount + workingCount(applyJobs) >= 2) throw capacityError('Sono già in corso due aggiornamenti import. Attendi e riprova.');
+    const job = { id: randomUUID(), status: 'running', _working: true, progress: { completed: 0, total: prepared.rows.length }, result: null, error: null };
+    applyJobs.set(job.id, job, importReservation(prepared.rows));
     prepared.verified.inUse = true;
-    const job = { id: randomUUID(), status: 'running', progress: { completed: 0, total: prepared.rows.length }, result: null, error: null };
-    applyJobs.set(job.id, job);
     void runApplyJob(job, prepared);
     res.status(202).json({ jobId: job.id, progress: job.progress });
-  } catch (error) { res.status(400).json({ error: error.message }); }
+  } catch (error) { res.status(error.status || 400).json({ error: error.message }); }
 });
 
 app.get('/api/import/apply-jobs/:jobId', (req, res) => {
@@ -1200,7 +1275,40 @@ app.use((error, _req, res, _next) => {
   }
   res.status(status).json({ error: message });
 });
-app.listen(port, () => console.log(`Importatore disponibile su http://localhost:${port}`));
+const server = app.listen(port, () => console.log(`Importatore disponibile su http://localhost:${port}`));
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  cronService.stop();
+  cronService.stopScan();
+  shutdownController.abort();
+  const stoppingNotifications = notificationOutbox.stop();
+  for (const job of rabenBetaJobs.values()) { job.cancelRequested = true; job.abortController?.abort(); }
+  const force = setTimeout(() => process.exit(1), 25000);
+  force.unref();
+  try {
+    await new Promise((resolve) => server.close(resolve));
+    const end = Date.now() + 22000;
+    while (cronService.isRunning || synchronousApplyCount || [...rabenBetaJobs.values(), ...verificationJobs.values(), ...applyJobs.values()].some((job) => job._working)) {
+      if (Date.now() >= end) throw new Error('Cleanup cron oltre il limite di arresto.');
+      await pause(100);
+    }
+    await cronService.notificationEvaluation?.catch(() => {});
+    await cronService.previewPromise?.catch(() => {});
+    await flushShipmentWrites();
+    await stoppingNotifications;
+    await cronCalculator.close();
+    runtimeDiagnostics.close();
+    stopTemporaryCleanup();
+    clearTimeout(force);
+    process.exit(0);
+  } catch (error) {
+    console.error('[SHUTDOWN]', error.message);
+    process.exit(1);
+  }
+}
+process.on('SIGTERM', () => { void shutdown(); });
+process.on('SIGINT', () => { void shutdown(); });
 
 function chunks(items, size) {
   return Array.from({ length: Math.ceil(items.length / size) }, (_value, index) => items.slice(index * size, index * size + size));
@@ -1216,9 +1324,11 @@ async function pauseRabenBetaJob(job, milliseconds) {
   return !job.cancelRequested;
 }
 
-function cleanupRabenBetaJobLater(job) {
-  const timer = setTimeout(() => rabenBetaJobs.delete(job.id), Raben_BETA_JOB_RETENTION_MS);
-  timer.unref?.();
+function finishRabenBetaJob(job) {
+  job._working = false;
+  job.config = null;
+  job.abortController = null;
+  rabenBetaJobs.finish(job.id);
 }
 
 function rabenBetaJobSafeguards(beta, job) {
@@ -1257,7 +1367,7 @@ function scheduleRabenBetaJob(job, trackingNumbers) {
       job.progress.finishedAt = new Date().toISOString();
       job.progress.updatedAt = job.progress.finishedAt;
       job.result = { results: job.results, cancelled: true, safeguards: rabenBetaJobSafeguards(null, job) };
-      cleanupRabenBetaJobLater(job);
+      finishRabenBetaJob(job);
       return;
     }
     job.status = 'running';
@@ -1271,7 +1381,7 @@ function scheduleRabenBetaJob(job, trackingNumbers) {
     job.progress.phase = 'failed';
     job.result = { results: job.results, cancelled: false, safeguards: rabenBetaJobSafeguards(null, job) };
     job.progress.updatedAt = new Date().toISOString();
-    cleanupRabenBetaJobLater(job);
+    finishRabenBetaJob(job);
   });
 }
 
@@ -1279,6 +1389,7 @@ function prepareApply(payload) {
   const { verificationId, carrierId, stateId, selectedSourceRows } = payload;
   const { updateTracking, updateState, overwriteTracking } = normalizeImportOptions(payload);
   const verified = verifiedImports.get(verificationId);
+  if (verified?.pending || verified?.inUse) throw Object.assign(new Error('Un’operazione per questa verifica è già in corso.'), { status: 409 });
   if (!verified || verified.expiresAt < Date.now()) throw new Error('La verifica è scaduta. Eseguila nuovamente prima di importare.');
   const selectedRows = new Set((selectedSourceRows ?? []).map(Number));
   if (!updateTracking && !updateState) throw new Error('Scegli almeno un aggiornamento: tracking/corriere o stato ordine.');
@@ -1316,15 +1427,19 @@ async function runApplyJob(job, prepared) {
     prepared.verified.inUse = false;
     job.error = error.message;
     job.status = 'failed';
+  } finally {
+    prepared.verified.inUse = false;
+    job._working = false;
+    applyJobs.finish(job.id);
   }
 }
 
 async function runRabenBetaJob(job, trackingNumbers) {
-  const beta = new RabenBetaClient(job.config);
+  const beta = new RabenBetaClient(job.config, { signal: job.abortController ? AbortSignal.any([shutdownController.signal, job.abortController.signal]) : shutdownController.signal });
   try {
     for (const [index, trackingNumber] of trackingNumbers.entries()) {
       if (job.cancelRequested) break;
-      const checkStartedAt = Date.now();
+      let checkStartedAt = Date.now();
       const profileBeforeCheck = beta.getRuntimeProfile();
       Object.assign(job.progress, {
         phase: 'checking',
@@ -1358,9 +1473,13 @@ async function runRabenBetaJob(job, trackingNumbers) {
           job.results.push({ trackingNumber, ...cachedValue, cached: true });
         } else {
           try {
-            let value = await beta.track(trackingNumber);
+            const turnOptions = {
+              onWaiting: () => Object.assign(job.progress, { phase: 'browser-waiting', updatedAt: new Date().toISOString() }),
+              onStarted: () => { checkStartedAt = Date.now(); Object.assign(job.progress, { phase: 'checking', updatedAt: new Date().toISOString() }); },
+            };
+            let value = await beta.track(trackingNumber, turnOptions);
             if (value.reasonCode === 'SHIPMENT_NOT_FOUND' && existing?.secondaryTrackingNumber) {
-              const fallback = await beta.track(existing.secondaryTrackingNumber);
+              const fallback = await beta.track(existing.secondaryTrackingNumber, turnOptions);
               value = {
                 ...fallback,
                 queriedTrackingNumber: existing.secondaryTrackingNumber,
@@ -1376,6 +1495,8 @@ async function runRabenBetaJob(job, trackingNumbers) {
               if (index < trackingNumbers.length - 1) await pauseRabenBetaJob(job, 6000 + Math.floor(Math.random() * 2000));
             }
           } catch (error) {
+            if (job.cancelRequested || shutdownController.signal.aborted) break;
+            if (['BROWSER_QUEUE_TIMEOUT', 'BROWSER_QUEUE_FULL'].includes(error.code)) throw error;
             job.results.push({ trackingNumber, status: 'Errore verifica', detail: error.message, source: 'Nessuna modifica è stata eseguita.', cached: false });
             await beta.resetSession('Modalità affidabile attivata dopo un errore di navigazione Camoufox.');
             if (index < trackingNumbers.length - 1) await pauseRabenBetaJob(job, 5000);
@@ -1424,7 +1545,8 @@ async function runRabenBetaJob(job, trackingNumbers) {
   }
   finally {
     await beta.close();
-    cleanupRabenBetaJobLater(job);
+    job.abortController = null;
+    finishRabenBetaJob(job);
   }
 }
 
@@ -1490,12 +1612,19 @@ async function runVerification(job, rows) {
     } catch (batchErr) {
       console.error('[BATCH] Errore registrazione lotto:', batchErr.message);
     }
-    const verificationId = randomUUID();
-    verifiedImports.set(verificationId, { rows: verified, expiresAt: Date.now() + VERIFIED_IMPORT_TTL_MS });
+    if (job.cancelRequested) { job.status = 'cancelled'; return; }
+    const verificationId = job.verificationId;
+    const reserved = verifiedImports.get(verificationId);
+    Object.assign(reserved, { rows: verified, pending: false, _working: false, expiresAt: Date.now() + VERIFIED_IMPORT_TTL_MS });
+    verifiedImports.finish(verificationId);
     job.result = { verificationId, summary, rows: verified, requestPlan: { batches: Math.ceil(candidates.length / VERIFY_BATCH_SIZE), maxRequests: 1 + Math.ceil(candidates.length / VERIFY_BATCH_SIZE) * 2, intervalMs: 800 } };
     job.status = 'complete';
   } catch (error) {
     job.error = error.message;
     job.status = 'failed';
+  } finally {
+    if (verifiedImports.get(job.verificationId)?.pending) verifiedImports.delete(job.verificationId);
+    job._working = false;
+    verificationJobs.finish(job.id);
   }
 }

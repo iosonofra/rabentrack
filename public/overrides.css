@@ -5966,3 +5966,18 @@ dialog[open]::backdrop { opacity: 1; }
   from { opacity: 0; }
   to { opacity: 1; }
 }
+/* Persistent notification delivery history, within the existing settings surface. */
+.notification-outbox { min-width: 0; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+.notification-outbox-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.notification-outbox-toolbar h3 { margin: 0; }
+.notification-outbox > p { max-width: 72ch; line-height: 1.5; }
+.notification-outbox .table-wrap { max-width: 100%; overflow-x: auto; }
+#notification-outbox-table { width: 100%; min-width: 600px; border-collapse: collapse; }
+#notification-outbox-table th, #notification-outbox-table td { padding: 10px; text-align: left; vertical-align: top; white-space: normal; border-bottom: 1px solid var(--line); font-size: .8rem; }
+#notification-outbox-table td:first-child { max-width: 340px; overflow-wrap: anywhere; }
+#notification-outbox-table small { display: block; margin-top: 5px; line-height: 1.45; }
+#notification-outbox-table button { margin: 0 4px 5px 0; }
+.notification-outbox-status { font-weight: 600; }
+.notification-outbox-status[data-status="sent"] { color: #17613d; }
+.notification-outbox-status[data-status="uncertain"], .notification-outbox-status[data-status="paused"] { color: #805000; }
+.notification-outbox-status[data-status="failed"], .notification-outbox-error { color: #a21c24; }

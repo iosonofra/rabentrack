@@ -1,17 +1,37 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findRabenStatusEvent, isRabenTableHeader, normalizeRabenTimeline, parseRabenEventDate } from './raben-beta-client.js';
+import { AtomicJsonWriter } from './atomic-json-writer.js';
+import { isTechnicalRabenStatus, latestRabenEvent } from './raben-event-time.js';
+import { setImmediate as yieldTurn } from 'node:timers/promises';
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const storePath = join(projectRoot, 'data', 'shipments.json');
 let database = null;
-let writeChain = Promise.resolve();
+let loading = null;
+const writer = new AtomicJsonWriter({ path: storePath, getValue: () => database });
 
-async function load() {
-  if (database) return database;
+function load() {
+  if (loading) return loading;
+  if (database) return Promise.resolve(database);
+  loading = initialize().catch((error) => { database = null; throw error; }).finally(() => { loading = null; });
+  return loading;
+}
+
+async function initialize() {
   try { database = JSON.parse(await readFile(storePath, 'utf8')); }
-  catch { database = { shipments: {} }; }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    database = { shipments: {} };
+  }
+  if (!database || typeof database !== 'object' || Array.isArray(database)
+    || (database.shipments !== undefined && (!database.shipments || typeof database.shipments !== 'object' || Array.isArray(database.shipments)))
+    || (database.batches !== undefined && !Array.isArray(database.batches))
+    || (database.operations !== undefined && !Array.isArray(database.operations))
+    || Object.values(database.shipments || {}).some((record) => !record || typeof record !== 'object' || Array.isArray(record))) {
+    throw new Error('Formato archivio spedizioni non valido: file preservato, ripristinare una copia valida.');
+  }
   database.shipments ||= {};
   database.batches ||= [];
   database.operations ||= [];
@@ -45,7 +65,9 @@ async function load() {
     })).filter((entry) => entry.status)
     : [];
   let migrated = invalidRecords.length > 0 || invalidRegistry;
+  let migratedCount = 0;
   for (const record of Object.values(database.shipments)) {
+    if (++migratedCount % 200 === 0) await yieldTurn();
     const storedStatus = normalizeStoredRabenStatus(record.rabenStatus);
     const recoveredRawStatus = normalizeStoredRabenStatus(record.rabenRawStatus);
     const normalizedStatus = ['In transito', 'Eccezione Raben'].includes(storedStatus)
@@ -74,6 +96,12 @@ async function load() {
     record.rabenStatusDateRaw = event.statusDateRaw;
     record.rabenStatusDatePrecision = event.statusDatePrecision;
     migrated = true;
+  }
+  for (const record of Object.values(database.shipments)) {
+    if (++migratedCount % 200 === 0) await yieldTurn();
+    if (record.rabenLastEventAt) continue;
+    const event = latestRabenEvent(record);
+    if (event) { record.rabenLastEventAt = event.value; migrated = true; }
   }
   if (migrated) await persist();
   return database;
@@ -229,22 +257,17 @@ export async function getExistingShipmentsIndex() {
   return { byTracking, byReference };
 }
 
-async function persist() {
-  const next = writeChain.then(async () => {
-    await mkdir(dirname(storePath), { recursive: true });
-    const temporaryPath = `${storePath}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(database), 'utf8');
-    await rename(temporaryPath, storePath);
-  });
-  writeChain = next.catch(() => {});
-  return next;
-}
+function persist() { return writer.request(); }
+
+export async function flushShipmentWrites() { if (loading) await loading; await writer.flush(); }
+export function getShipmentPersistenceStats() { return writer.stats(); }
 
 export async function syncVerifiedShipments(rows) {
   const db = await load();
   for (const row of rows) {
     if (!row.trackingNumber || row.alreadyImported) continue;
     const previous = db.shipments[row.trackingNumber] || { trackingNumber: row.trackingNumber, events: [] };
+    const importedStatusChanged = Boolean(row.rabenStatus && normalizeStoredRabenStatus(row.rabenStatus) !== normalizeStoredRabenStatus(previous.rabenStatus));
     const record = db.shipments[row.trackingNumber] = {
       ...previous,
       trackingNumber: row.trackingNumber,
@@ -270,6 +293,10 @@ export async function syncVerifiedShipments(rows) {
       prestaStatus: row.verification || row.validation || previous.prestaStatus || '',
       existingTracking: row.existingTracking || previous.existingTracking || '',
       rabenStatus: normalizeStoredRabenStatus(row.rabenStatus || previous.rabenStatus),
+      rabenStatusChangedAt: importedStatusChanged && !isTechnicalRabenStatus(normalizeStoredRabenStatus(row.rabenStatus)) ? now() : previous.rabenStatusChangedAt || '',
+      rabenStatusAt: importedStatusChanged ? '' : previous.rabenStatusAt || '',
+      rabenStatusDateRaw: importedStatusChanged ? '' : previous.rabenStatusDateRaw || '',
+      rabenStatusDatePrecision: importedStatusChanged ? '' : previous.rabenStatusDatePrecision || '',
       rabenRawStatus: row.rabenRawStatus || previous.rabenRawStatus || '',
       rabenEvidence: row.rabenStatus ? 'raben-export' : previous.rabenEvidence || '',
       rabenConfidence: row.rabenStatus ? 0.85 : Number(previous.rabenConfidence) || 0,
@@ -291,6 +318,7 @@ export async function syncRabenShipments(results) {
     const record = db.shipments[result.trackingNumber] ||= { trackingNumber: result.trackingNumber, events: [] };
     const nextRabenStatus = normalizeStoredRabenStatus(result.status);
     const sameRabenStatus = normalizeStoredRabenStatus(record.rabenStatus) === nextRabenStatus;
+    if (!sameRabenStatus && !isTechnicalRabenStatus(nextRabenStatus)) record.rabenStatusChangedAt = now();
     record.rabenStatus = nextRabenStatus;
     record.rabenDetail = result.detail || '';
     record.rabenRawStatus = result.rawStatus || '';
@@ -309,6 +337,8 @@ export async function syncRabenShipments(results) {
     record.rabenStatusAt = result.statusAt || (sameRabenStatus ? record.rabenStatusAt || '' : '');
     record.rabenStatusDateRaw = result.statusDateRaw || (sameRabenStatus ? record.rabenStatusDateRaw || '' : '');
     record.rabenStatusDatePrecision = result.statusDatePrecision || (sameRabenStatus ? record.rabenStatusDatePrecision || '' : '');
+    const latestEvent = latestRabenEvent(record);
+    if (latestEvent) record.rabenLastEventAt = latestEvent.value;
     record.rabenCheckedAt = now();
     record.lastSeenAt = now();
     addEvent(record, 'raben', result.status, result.detail || '');

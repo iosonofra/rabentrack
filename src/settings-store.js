@@ -48,6 +48,10 @@ export function normalizeRabenStateMappings(value = {}) {
 
 export function normalizeNotificationSettings(input = {}) {
   const raw = input && typeof input === 'object' ? input : {};
+  const clockValue = (value, fallback, maximum) => {
+    const number = Number(value ?? fallback);
+    return Number.isFinite(number) ? Math.min(Math.max(Math.trunc(number), 0), maximum) : fallback;
+  };
   const telegram = {
     enabled: Boolean(raw.telegram?.enabled),
     botToken: String(raw.telegram?.botToken || '').trim(),
@@ -70,8 +74,8 @@ export function normalizeNotificationSettings(input = {}) {
     sla48h: raw.triggers?.sla48h !== undefined ? Boolean(raw.triggers?.sla48h) : true,
     autoSyncSuccess: raw.triggers?.autoSyncSuccess !== undefined ? Boolean(raw.triggers?.autoSyncSuccess) : true,
     dailyDigest: raw.triggers?.dailyDigest !== undefined ? Boolean(raw.triggers?.dailyDigest) : true,
-    digestHour: Math.min(Math.max(Number(raw.triggers?.digestHour ?? 8), 0), 23),
-    digestMinute: Math.min(Math.max(Number(raw.triggers?.digestMinute ?? 30), 0), 59),
+    digestHour: clockValue(raw.triggers?.digestHour, 8, 23),
+    digestMinute: clockValue(raw.triggers?.digestMinute, 30, 59),
   };
 
   return { telegram, email, triggers };

@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
+import { deadline, pause } from './operation-control.js';
+import { browserCoordinator } from './browser-coordinator.js';
 
 export { normalizeRabenSpeedProfile } from './raben-speed-profile.js';
 
@@ -300,19 +302,27 @@ export function parseRabenDomEvidence(evidence = {}) {
 }
 
 export class RabenBetaClient {
-  constructor(settings) {
+  constructor(settings, { signal, trackingTimeoutMs = 120000, scope = 'manual', coordinator = browserCoordinator } = {}) {
     this.settings = normalizeBetaSettings(settings);
     this.userId = 'prestashop-raben-beta';
-    this.activeSessionKey = 'raben-shared-session';
+    this.activeSessionKey = `raben-${scope}-${randomUUID()}`;
     this.requestedSpeedProfile = this.settings.speedProfile;
     this.effectiveSpeedProfile = this.requestedSpeedProfile;
     this.activeTabId = '';
     this.unstableResultCount = 0;
     this.fallbackReason = '';
     this.cookieConsentChecked = false;
+    this.signal = signal;
+    this.trackingTimeoutMs = trackingTimeoutMs;
+    this.scope = scope;
+    this.coordinator = coordinator;
   }
 
   async resetSession(reason = 'La sessione Camoufox è stata reimpostata dopo un errore.') {
+    return this.coordinator.run(() => this.resetSessionExclusive(reason), { scope: this.scope, cleanup: true });
+  }
+
+  async resetSessionExclusive(reason) {
     const staleTabId = this.activeTabId;
     this.activeTabId = '';
     this.cookieConsentChecked = false;
@@ -341,11 +351,16 @@ export class RabenBetaClient {
 
   async closeTab(tabId) {
     if (!tabId) return;
-    await this.request(`/tabs/${encodeURIComponent(tabId)}?userId=${encodeURIComponent(this.userId)}`, { method: 'DELETE' }).catch(() => {});
+    await this.request(`/tabs/${encodeURIComponent(tabId)}?userId=${encodeURIComponent(this.userId)}`, { method: 'DELETE', cleanup: true }).catch(() => {});
     if (this.activeTabId === tabId) this.activeTabId = '';
   }
 
   async close() {
+    if (!this.activeTabId) return;
+    return this.coordinator.run(() => this.closeExclusive(), { scope: this.scope, cleanup: true });
+  }
+
+  async closeExclusive() {
     const tabId = this.activeTabId;
     this.activeTabId = '';
     await this.closeTab(tabId);
@@ -393,17 +408,17 @@ export class RabenBetaClient {
   }
 
   async request(path, options = {}) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const { cleanup, ...fetchOptions } = options;
+    const budget = deadline(REQUEST_TIMEOUT_MS, cleanup ? undefined : this.trackSignal || this.signal, 'Camofox non ha risposto entro 20 secondi.');
     try {
       const response = await fetch(`${this.settings.camofoxUrl}${path}`, {
-        ...options,
+        ...fetchOptions,
         headers: {
           'Content-Type': 'application/json',
           ...(process.env.CAMOFOX_ACCESS_KEY ? { Authorization: `Bearer ${process.env.CAMOFOX_ACCESS_KEY}` } : {}),
           ...(options.headers || {}),
         },
-        signal: controller.signal,
+        signal: budget.signal,
       });
       const body = await response.text();
       let data;
@@ -411,13 +426,17 @@ export class RabenBetaClient {
       if (!response.ok) throw new Error(data.error || data.message || `Camofox ha risposto HTTP ${response.status}.`);
       return data;
     } catch (error) {
-      if (error.name === 'AbortError') throw new Error('Camofox non ha risposto entro 20 secondi.');
+      if (budget.signal.aborted) throw budget.signal.reason;
       if (error instanceof TypeError && error.message === 'fetch failed') throw new Error('Camofox locale non è raggiungibile. Avvialo con npm run camofox e riprova.');
       throw error;
-    } finally { clearTimeout(timer); }
+    } finally { budget.dispose(); }
   }
 
   async testConnection() {
+    return this.coordinator.run(() => this.testConnectionExclusive(), { scope: this.scope, signal: this.signal });
+  }
+
+  async testConnectionExclusive() {
     // /health conferma soltanto che il server HTTP risponde. /start verifica
     // anche schema, binario, display virtuale e avvio effettivo del browser.
     await this.request('/start', { method: 'POST' });
@@ -492,7 +511,10 @@ export class RabenBetaClient {
     let pollIndex = 0;
     let lastEvidence = { headings: [], summary: {}, summaryTexts: [], activeTexts: [], timeline: [], frameCount: 0 };
     do {
-      const domEvidence = await this.extractDomEvidence(tabId).catch(() => lastEvidence);
+      const domEvidence = await this.extractDomEvidence(tabId).catch((error) => {
+        (this.trackSignal || this.signal)?.throwIfAborted();
+        return lastEvidence;
+      });
       lastEvidence = domEvidence;
       const domResult = parseRabenDomEvidence(domEvidence);
       if (acceleratedMode && domEvidence.timeline.length && domResult?.status !== 'Da verificare manualmente' && domResult?.confidence >= .9) {
@@ -515,18 +537,28 @@ export class RabenBetaClient {
           ? pollIntervals[Math.min(pollIndex, pollIntervals.length - 1)]
           : TRACKING_POLL_INTERVAL_MS;
         pollIndex += 1;
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await pause(delayMs, this.trackSignal || this.signal);
       }
     } while (Date.now() < deadline);
     const fallback = best?.status !== 'Da verificare manualmente' ? best : statusResult('Da verificare manualmente', 'Il tracking Raben non ha esposto uno stato stabile entro il tempo previsto. Puoi riprovare.', { evidence: best?.evidence || 'none', confidence: best?.confidence || 0, reasonCode: 'STATUS_TIMEOUT', rawStatus: best?.rawStatus || '' });
     return { result: fallback, timeline: lastEvidence.timeline, summary: lastEvidence.summary };
   }
 
-  async track(trackingNumber) {
+  async track(trackingNumber, { signal, onWaiting, onStarted } = {}) {
+    const parent = signal && this.signal ? AbortSignal.any([signal, this.signal]) : signal || this.signal;
+    return this.coordinator.run(() => this.trackExclusive(trackingNumber, { signal: parent }), { scope: this.scope, signal: parent, onWaiting, onStarted });
+  }
+
+  async trackExclusive(trackingNumber, { signal } = {}) {
+    const parent = signal && this.signal ? AbortSignal.any([signal, this.signal]) : signal || this.signal;
+    const budget = deadline(this.trackingTimeoutMs, parent, 'Verifica Raben oltre il tempo massimo complessivo.');
+    this.trackSignal = budget.signal;
+    let tabId;
+    try {
     const trackingUrl = this.settings.trackingUrl.includes('TRACKINGDAINSERIRE')
       ? this.settings.trackingUrl.replaceAll('TRACKINGDAINSERIRE', encodeURIComponent(trackingNumber))
       : this.settings.trackingUrl;
-    const tabId = await this.acquireTab(trackingUrl);
+    tabId = await this.acquireTab(trackingUrl);
     const snapshot = async () => {
       const value = await this.request(`/tabs/${encodeURIComponent(tabId)}/snapshot?userId=${encodeURIComponent(this.userId)}`);
       return value.snapshot || value.data?.snapshot || value.raw || '';
@@ -539,8 +571,7 @@ export class RabenBetaClient {
       this.noteTrackingResult(output);
       return output;
     };
-    try {
-      await new Promise((resolve) => setTimeout(resolve, Raben_SPEED_PROFILES[this.effectiveSpeedProfile].initialDelayMs));
+      await pause(Raben_SPEED_PROFILES[this.effectiveSpeedProfile].initialDelayMs, this.trackSignal);
       const directUrl = this.settings.trackingUrl.includes('TRACKINGDAINSERIRE');
       const shouldInspectEntryPage = this.effectiveSpeedProfile === 'safe' || !directUrl || !this.cookieConsentChecked;
       let page = '';
@@ -549,7 +580,7 @@ export class RabenBetaClient {
         const necessaryOnlyRef = findRef(page, /use necessary cookies only|rifiuta tutto|solo cookie necessari|reject all/i);
         if (necessaryOnlyRef) {
           await this.request(`/tabs/${encodeURIComponent(tabId)}/click`, { method: 'POST', body: JSON.stringify({ userId: this.userId, ref: necessaryOnlyRef }) });
-          await new Promise((resolve) => setTimeout(resolve, 350));
+          await pause(350, this.trackSignal);
           page = await snapshot();
         }
         this.cookieConsentChecked = true;
@@ -566,7 +597,7 @@ export class RabenBetaClient {
       const trackingMenuRef = findRef(page, /(?:button|link).*\b(?:track|tracking|spedizioni|ricerca spedizioni)\b/i);
       if (trackingMenuRef) {
         await this.request(`/tabs/${encodeURIComponent(tabId)}/click`, { method: 'POST', body: JSON.stringify({ userId: this.userId, ref: trackingMenuRef }) });
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await pause(500, this.trackSignal);
         page = await snapshot();
       }
 
@@ -576,7 +607,10 @@ export class RabenBetaClient {
       const observed = await this.waitForTrackingResult(tabId, snapshot);
       return enrich(observed.result, 'Portale pubblico Raben tramite Camofox.', observed.timeline, observed.summary);
     } finally {
-      if (!Raben_SPEED_PROFILES[this.effectiveSpeedProfile].reuseTab || this.activeTabId !== tabId) await this.closeTab(tabId);
+      const aborted = budget.signal.aborted;
+      budget.dispose();
+      this.trackSignal = null;
+      if (aborted || !Raben_SPEED_PROFILES[this.effectiveSpeedProfile].reuseTab || this.activeTabId !== tabId) await this.closeTab(tabId);
     }
   }
 }
