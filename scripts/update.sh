@@ -1,4 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env bash
+# Also support an explicit `sh scripts/update.sh` invocation on Debian.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 set -e
 
 # ==============================================================================
@@ -36,17 +40,13 @@ should_update_camofox() {
         return 1
     fi
 
-    if ! command -v timeout >/dev/null 2>&1; then
-        echo "Comando timeout non disponibile: browser Camoufox non aggiornato per evitare una richiesta bloccante." >&2
-        return 1
-    fi
-
-    printf "Aggiornare anche il browser Camoufox? [s/N] (risposta entro 30 secondi): "
-    if CAMOFOX_ANSWER="$(timeout 30 sh -c 'IFS= read -r answer || exit 1; printf "%s" "$answer"')"; then
+    printf "Aggiornare anche il browser Camoufox? [s/N] (un tasto, senza Invio; NO dopo 30 secondi): "
+    CAMOFOX_ANSWER=""
+    if IFS= read -r -n 1 -t 30 CAMOFOX_ANSWER; then
         printf '\n'
     else
         CAMOFOX_ANSWER=""
-        printf '\nTempo scaduto: selezionato automaticamente NO.\n'
+        printf '\nNessuna risposta ricevuta: selezionato automaticamente NO.\n'
     fi
 
     case "${CAMOFOX_ANSWER}" in

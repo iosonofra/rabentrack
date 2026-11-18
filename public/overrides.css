@@ -225,11 +225,13 @@ main > .workspace-view {
 .control-metric.attention { box-shadow: inset 0 3px var(--danger); }
 .control-metric.attention strong { color: var(--danger); }
 
-.control-quick-filters { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 18px 10px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; flex-shrink: 0; }
-.control-quick-filters::-webkit-scrollbar { height: 0; }
-.filter-bar-label { position: sticky; left: 0; z-index: 1; flex: 0 0 auto; padding-right: 10px; background: #fff; color: var(--muted); font-size: .76rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; font-family: 'Roboto', sans-serif; }
+.control-quick-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; max-width: 100%; min-height: 40px; padding: 0 18px 10px; overflow: visible; flex-shrink: 0; }
+.filter-bar-label { flex: 0 0 auto; padding-right: 10px; background: #fff; color: var(--muted); font-size: .76rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; font-family: 'Roboto', sans-serif; }
 .control-quick-filter { display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto; min-height: 32px; padding: 5px 12px; border: 1px solid var(--line-strong); border-radius: 3px; background: #fff; color: var(--ink); font-size: .80rem; font-family: 'Roboto', sans-serif; font-weight: 500; cursor: pointer; transition: all .12s ease; }
 .control-quick-filter strong { display: inline-grid; place-items: center; min-width: 20px; min-height: 18px; padding: 0 5px; border-radius: 9px; background: #f4f4f4; color: #505456; font-size: .72rem; font-variant-numeric: tabular-nums; }
+.control-quick-filters .control-quick-filter { max-width: 100%; white-space: normal; text-align: left; }
+.control-quick-filters .control-quick-filter > span:not(.unsynced-dot) { min-width: 0; overflow-wrap: anywhere; }
+.control-quick-filters .control-quick-filter strong { flex-shrink: 0; }
 .control-quick-filter:hover { border-color: var(--raben-red); background: var(--raben-red-soft); color: var(--raben-thunder); }
 .control-quick-filter.active { border-color: var(--raben-red); background: var(--raben-red); color: #fff; font-weight: 600; }
 .control-quick-filter.active strong { background: rgba(255,255,255,.22); color: #fff; }
@@ -240,7 +242,7 @@ main > .workspace-view {
 .control-quick-filter.archived:hover { border-color: #68737a; background: #e8e8e8; color: var(--ink); }
 .control-quick-filter.archived.active { border-color: #505456; background: #505456; color: #fff; }
 .control-quick-filter.archived.active strong { background: rgba(255,255,255,.2); color: #fff; }
-.control-filter-spacer { flex: 1 1 auto; min-width: 12px; }
+.control-filter-spacer { display: none; }
 .control-filters { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 18px 12px; flex-shrink: 0; flex-wrap: wrap; }
 .control-filters .control-raben-filter-label { display: none !important; }
 .control-filters label { color: var(--ink); font-size: .80rem; font-weight: 500; font-family: 'Roboto', sans-serif; display: flex; flex-direction: column; gap: 4px; }
