@@ -2,7 +2,21 @@
 
 Web app Node.js per importare tracking Raben da Excel, ricercare gli ordini con il loro riferimento e impostare tracking, corriere e stato.
 
-## Avvio
+## Pacchetto ZIP di installazione e aggiornamento
+
+Generare con `npm run package:zip`. Gli archivi includono soltanto `data/.gitkeep`,
+`public/`, `scripts/`, `src/`, `.env.example`, `.gitignore`, `DEPLOY_PROXMOX.md`,
+`package.json`, `package-lock.json`, `pnpm-workspace.yaml` e `README.md`.
+Nuovi file o cartelle alla root vengono aggiunti solo quando necessari al
+funzionamento dell'app o all'installazione di nuove funzioni.
+
+Test, audit, piani, documenti di rollback, contesto di design e configurazioni
+Docker restano nel progetto sorgente, esclusi dallo ZIP. `.git` viene creata
+da `git clone` e non viene distribuita nell'archivio. Dati reali, `.env`, cache
+e `node_modules` restano esclusi; `data/` contiene soltanto il segnaposto.
+I test si eseguono dal progetto sorgente, dove è presente `tests/`.
+
+## Avvio dell'applicazione
 
 1. Facoltativamente copia `.env.example` in `.env` per definire la configurazione iniziale. URL e chiave inseriti dall'interfaccia vengono conservati localmente in `data/settings.json`, escluso dal controllo versione.
 2. Installa le dipendenze con `npm install`.

@@ -296,6 +296,12 @@ systemctl start camofox raben-tracking-center
 
 Lo zip di aggiornamento include tutto il codice aggiornato, frontend e script, escludendo cartelle dati (`data/`), credenziali (`.env`) e `node_modules` (che verranno compilate per Linux).
 
+La struttura distribuita è limitata a `public/`, `scripts/`, `src/`,
+`data/.gitkeep`, `.env.example`, `.gitignore`, `package.json`, `package-lock.json`,
+`pnpm-workspace.yaml`, `README.md` e questa guida. Altre voci vengono aggiunte
+solo se necessarie al funzionamento o all'installazione. La cartella `.git`
+viene creata con `git clone`; test e documenti di sviluppo restano nel sorgente.
+
 1. Copiare l'archivio ZIP sul server o nel container LXC (es. tramite Proxmox host: `pct push <ID_CT> raben-tracking-center-update.zip /tmp/raben-update.zip` o via SCP/SFTP in `/tmp`).
 2. Eseguire nel container:
 

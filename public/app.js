@@ -723,59 +723,25 @@ function renderControlPrestaFilter(data) {
   positionControlPrestaFilter();
 }
 
-function closeControlCheckSortMenu() {
-  const menu = $('#control-check-sort-menu');
-  const trigger = $('#control-check-sort-trigger');
-  if (menu) menu.hidden = true;
-  if (trigger) trigger.setAttribute('aria-expanded', 'false');
-}
-
-function positionControlCheckSortMenu() {
-  const menu = $('#control-check-sort-menu');
-  const trigger = $('#control-check-sort-trigger');
-  if (!menu || !trigger || menu.hidden) return;
-  const rect = trigger.getBoundingClientRect();
-  const width = Math.min(280, window.innerWidth - 24);
-  menu.style.width = `${width}px`;
-  menu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - width - 12))}px`;
-  menu.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - menu.offsetHeight - 12)}px`;
-}
-
 function renderControlCheckSort() {
-  const menu = $('#control-check-sort-menu');
   const trigger = $('#control-check-sort-trigger');
   if (!trigger) return;
   const isAsc = controlCheckSort === 'asc';
   trigger.classList.toggle('active', isAsc);
-  trigger.title = isAsc
-    ? 'Ordinamento: dal più vecchio al più recente (clicca per modificare)'
-    : 'Ordinamento: dal più recente al più vecchio (clicca per modificare)';
+  trigger.closest('th')?.setAttribute('aria-sort', isAsc ? 'ascending' : 'descending');
+  const description = isAsc
+    ? 'Ultimo controllo: meno recenti prima. Clicca per mostrare i più recenti prima.'
+    : 'Ultimo controllo: più recenti prima. Clicca per mostrare i meno recenti prima.';
+  trigger.title = description;
+  trigger.setAttribute('aria-label', description);
 
   trigger.innerHTML = `
-    <span id="control-check-sort-label">${isAsc ? 'Ultimo controllo (meno recenti)' : 'Ultimo controllo'}</span>
+    <span id="control-check-sort-label">Ultimo controllo</span>
     <svg viewBox="0 0 16 16" aria-hidden="true">
-      <path d="m4 6 4 4 4-4"/>
+      <path d="${isAsc ? 'M8 13V3m-4 4 4-4 4 4' : 'M8 3v10m-4-4 4 4 4-4'}"/>
     </svg>
   `;
 
-  if (!menu) return;
-  menu.innerHTML = `
-    <div class="control-column-filter-heading">
-      <strong>Ultimo controllo</strong>
-      <span>Ordinamento</span>
-    </div>
-    <div class="control-column-filter-options">
-      <button type="button" class="control-column-filter-option${!isAsc ? ' active' : ''}" data-check-sort="desc" role="menuitemradio" aria-checked="${!isAsc}">
-        <span>Dal più recente al più vecchio</span>
-        ${!isAsc ? '<strong><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg></strong>' : ''}
-      </button>
-      <button type="button" class="control-column-filter-option${isAsc ? ' active' : ''}" data-check-sort="asc" role="menuitemradio" aria-checked="${isAsc}">
-        <span>Dal vecchio al più recente</span>
-        ${isAsc ? '<strong><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg></strong>' : ''}
-      </button>
-    </div>
-  `;
-  positionControlCheckSortMenu();
 }
 
 function renderControlCenter(data) {
@@ -3051,9 +3017,8 @@ function setupControlWorkspace() {
   const checkHeader = [...card.querySelectorAll('#control-table thead th')].find((cell) => cell.textContent.trim().startsWith('Ultimo controllo'));
   if (checkHeader) {
     checkHeader.classList.add('control-filterable-header');
-    checkHeader.innerHTML = '<button id="control-check-sort-trigger" type="button" class="control-column-filter-trigger" aria-haspopup="menu" aria-expanded="false"></button>';
+    checkHeader.innerHTML = '<button id="control-check-sort-trigger" type="button" class="control-column-filter-trigger"></button>';
   }
-  if (!$('#control-check-sort-menu')) document.body.insertAdjacentHTML('beforeend', '<div id="control-check-sort-menu" class="control-column-filter-menu" role="menu" aria-label="Ordina per data ultimo controllo" hidden></div>');
   renderControlCheckSort();
   const initialEmptyCell = card.querySelector('#control-table tbody .control-empty');
   if (initialEmptyCell) initialEmptyCell.colSpan = card.querySelectorAll('#control-table thead th').length;
@@ -3080,7 +3045,6 @@ function setupControlWorkspace() {
     controlPrestaStateFilter = '';
     closeControlPrestaFilter();
     controlCheckSort = 'desc';
-    closeControlCheckSortMenu();
     showFloatingToast('Filtri azzerati: ripristinato ordinamento dal più recente', 'info');
     controlPage = 1;
     refreshControlCenter();
@@ -6434,7 +6398,6 @@ document.addEventListener('click', (event) => {
   const trigger = event.target.closest('#control-presta-filter-trigger');
   const menu = $('#control-presta-filter-menu');
   if (trigger && menu) {
-    closeControlCheckSortMenu();
     const willOpen = menu.hidden;
     menu.hidden = !willOpen;
     trigger.setAttribute('aria-expanded', String(willOpen));
@@ -6452,35 +6415,13 @@ document.addEventListener('click', (event) => {
   if (menu && !menu.hidden && !event.target.closest('#control-presta-filter-menu')) closeControlPrestaFilter();
 
   const checkTrigger = event.target.closest('#control-check-sort-trigger');
-  const checkMenu = $('#control-check-sort-menu');
-  if (checkTrigger && checkMenu) {
+  if (checkTrigger) {
     closeControlPrestaFilter();
-    const willOpen = checkMenu.hidden;
-    checkMenu.hidden = !willOpen;
-    checkTrigger.setAttribute('aria-expanded', String(willOpen));
-    if (willOpen) requestAnimationFrame(positionControlCheckSortMenu);
+    controlCheckSort = controlCheckSort === 'desc' ? 'asc' : 'desc';
+    controlPage = 1;
+    renderControlCheckSort();
+    void refreshControlCenter();
     return;
-  }
-  const checkOption = event.target.closest('#control-check-sort-menu [data-check-sort]');
-  if (checkOption) {
-    const selectedSort = checkOption.dataset.checkSort || 'desc';
-    closeControlCheckSortMenu();
-    if (selectedSort !== controlCheckSort) {
-      controlCheckSort = selectedSort;
-      controlPage = 1;
-      const isAsc = controlCheckSort === 'asc';
-      showFloatingToast(
-        isAsc
-          ? 'Ordinamento: dal più vecchio al più recente (meno recenti in cima)'
-          : 'Ordinamento: dal più recente al più vecchio (più recenti in cima)',
-        isAsc ? 'warning' : 'success'
-      );
-      refreshControlCenter();
-    }
-    return;
-  }
-  if (checkMenu && !checkMenu.hidden && !event.target.closest('#control-check-sort-menu')) {
-    closeControlCheckSortMenu();
   }
 });
 
@@ -6490,19 +6431,13 @@ document.addEventListener('keydown', (event) => {
     closeControlPrestaFilter();
     $('#control-presta-filter-trigger')?.focus();
   }
-  if (!$('#control-check-sort-menu')?.hidden) {
-    closeControlCheckSortMenu();
-    $('#control-check-sort-trigger')?.focus();
-  }
 });
 
 window.addEventListener('resize', () => {
   closeControlPrestaFilter();
-  closeControlCheckSortMenu();
 });
 window.addEventListener('scroll', () => {
   closeControlPrestaFilter();
-  closeControlCheckSortMenu();
 }, true);
 
 $('.control-center-card').addEventListener('click', (event) => {

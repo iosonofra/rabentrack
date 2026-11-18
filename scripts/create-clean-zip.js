@@ -7,8 +7,11 @@
  * Regole di pulizia:
  * - Esclude: node_modules/, data/settings.json, data/shipments.json, data/camofox-profile,
  *   .env (file con credenziali attive), .git/, .impeccable/, file di cache e log.
- * - Include: src/, public/, scripts/, tests/, data/.gitkeep, package.json, package-lock.json,
- *   pnpm-workspace.yaml, Dockerfile, docker-compose.yml, .env.example, .gitignore, documentazione.
+ * - Include solo: src/, public/, scripts/, data/.gitkeep, package.json, package-lock.json,
+ *   pnpm-workspace.yaml, .env.example, .gitignore, DEPLOY_PROXMOX.md e README.md.
+ * - Test, audit, piani, rollback e configurazioni Docker rimangono nel progetto.
+ * - Nuove voci alla root richiedono una necessità di funzionamento/installazione:
+ *   aggiornare esplicitamente la lista, senza includere automaticamente tutti i file.
  * - Converte automaticamente i file script (*.sh, *.initd, *.service) con terminatori di linea LF (Unix).
  * - Imposta i permessi POSIX eseguibili (0755) negli header ZIP per tutti gli script bash.
  */
@@ -28,34 +31,17 @@ const OUTPUT_ZIP_PATH = path.join(ROOT_DIR, OUTPUT_ZIP_NAME);
 const PARENT_ZIP_PATH = path.join(ROOT_DIR, '..', OUTPUT_ZIP_NAME);
 
 // Cartelle incluse (ricorsive)
-const INCLUDED_DIRS = ['src', 'public', 'scripts', 'tests'];
+const INCLUDED_DIRS = ['src', 'public', 'scripts'];
 
 // File singoli inclusi dalla root
 const INCLUDED_ROOT_FILES = [
   'package.json',
   'package-lock.json',
   'pnpm-workspace.yaml',
-  'Dockerfile',
-  'docker-compose.yml',
   '.env.example',
   '.gitignore',
   'README.md',
-  '006-cron-priorita-orari.md',
   'DEPLOY_PROXMOX.md',
-  'BROWSER-OPTIMIZATION-ROLLBACK.md',
-  'FRONTEND-OPTIMIZATION-ROLLBACK.md',
-  'RABEN-HEADER-FIX.md',
-  'CRON-AUDIT-2026-11-17.md',
-  'CRON-REMEDIATION-PLAN.md',
-  'CRON-PHASE-0-1A.md',
-  'CRON-PHASE-1B-2.md',
-  'CRON-PHASE-3A.md',
-  'CRON-PHASE-3B.md',
-  'CRON-PHASE-4.md',
-  'CRON-PHASE-5.md',
-  'CRON-PHASE-6.md',
-  'DESIGN.md',
-  'PRODUCT.md'
 ];
 
 // File specifici in altre cartelle
